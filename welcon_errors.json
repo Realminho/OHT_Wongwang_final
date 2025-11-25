@@ -1,0 +1,249 @@
+﻿[
+  {
+    "codeHex": "0x2310",
+    "name": "Over Current Error",
+    "category": "전류",
+    "causes": [
+      "모터 또는 엔코더 결선 문제",
+      "전류 제어기 게인 설정 오류",
+      "큰 관성/감속도로 인한 역기전력 발생"
+    ],
+    "actions": [
+      "모터 및 엔코더 결선 상태 확인",
+      "전류 제어기 게인 확인 및 Current Auto Tuning 재실행",
+      "감속도 완화 및 회생 제동 저항 연결/설정 확인"
+    ]
+  },
+  {
+    "codeHex": "0x3210",
+    "name": "Over Voltage Error",
+    "category": "전압",
+    "causes": [
+      "입력 전압이 DC Link Voltage Maximum Limit 설정값 초과",
+      "큰 관성/감속도로 인한 역기전력 발생"
+    ],
+    "actions": [
+      "입력 전압 사양 확인 및 조정",
+      "DC Link Voltage Maximum Limit 값 확인 및 변경",
+      "감속도 완화 및 회생 제동 저항 연결/설정 확인"
+    ]
+  },
+  {
+    "codeHex": "0x3210",
+    "name": "Under Voltage Error",
+    "category": "전압",
+    "causes": [
+      "입력 전압이 DC Link Voltage Minimum Limit 설정값 미만",
+      "모터 전원 미인가 또는 전원 공급 용량 부족"
+    ],
+    "actions": [
+      "입력 전압 사양 확인 및 조정",
+      "DC Link Voltage Minimum Limit 값 확인 및 변경",
+      "모터 전원 공급 상태 및 전원 공급기 용량 확인"
+    ]
+  },
+  {
+    "codeHex": "0x4210",
+    "name": "Over Temperature Error",
+    "category": "온도",
+    "causes": [
+      "서보 드라이브 온도 70℃ 초과",
+      "서보 드라이브에서 발생하는 열을 충분히 방출하지 못함"
+    ],
+    "actions": [
+      "시스템의 열 방출 능력 확인 및 개선"
+    ]
+  },
+  {
+    "codeHex": "0x5210",
+    "name": "Current Detection Error",
+    "category": "전류",
+    "causes": [
+      "전류 측정 센서의 오프셋이 기준치 불만족",
+      "모터 전원이 H/W Limit보다 높아 전류 센서 파손"
+    ],
+    "actions": [
+      "입력 전압이 H/W Limit보다 높은지 확인"
+    ]
+  },
+  {
+    "codeHex": "0x7310",
+    "name": "Speed Error",
+    "category": "속도",
+    "causes": [
+      "속도 오차가 Velocity Following Error Window 설정값 초과",
+      "모터 결선 오류로 인한 역회전",
+      "노이즈로 인한 엔코더 값 불안정",
+      "낮은 속도 제어기 게인"
+    ],
+    "actions": [
+      "Velocity Following Error Window 값 확인",
+      "모터 및 엔코더 결선 확인",
+      "속도 제어기 게인 확인"
+    ]
+  },
+  {
+    "codeHex": "0x7500",
+    "name": "Communication Error",
+    "category": "통신",
+    "causes": [
+      "모터 구동 중 통신 상태가 OP(Operation)에서 다른 상태로 변경됨"
+    ],
+    "actions": [
+      "모터 구동 중 통신 상태를 변경했는지 확인"
+    ]
+  },
+  {
+    "codeHex": "0x8611",
+    "name": "Following Error",
+    "category": "추종",
+    "causes": [
+      "위치 오차가 Following Error Window 설정값 초과",
+      "생성된 모션 속도가 모터의 최대 속도 초과",
+      "입력 전압이 모터 정격 전압보다 낮음",
+      "낮은 속도 또는 위치 제어기 게인"
+    ],
+    "actions": [
+      "모션 프로파일 확인",
+      "입력 전압 확인",
+      "Following Error Window 확인"
+    ]
+  },
+  {
+    "codeHex": "0xFF01",
+    "name": "Hall Sensor Error",
+    "category": "센서",
+    "causes": [
+      "홀센서 값이 0 또는 7",
+      "Hall Sensor 배선 잘못됨",
+      "노이즈로 인한 Hall Sensor 신호 변경"
+    ],
+    "actions": [
+      "Hall Sensor 배선 확인",
+      "Hall Sensor 배선에 영향을 줄 수 있는 노이즈 요소 확인"
+    ]
+  },
+  {
+    "codeHex": "0xFF02",
+    "name": "Over Load Error",
+    "category": "부하",
+    "causes": [
+      "연속 전류보다 높은 전류가 설정 시간보다 길게 유지됨",
+      "모터의 연속 토크보다 큰 부하 발생",
+      "모터 전기각 불일치"
+    ],
+    "actions": [
+      "I2T Duration Time(0x2400.0x00) 확인",
+      "모터 및 엔코더 결선 상태 확인",
+      "Phase Auto Tuning 재실행"
+    ]
+  },
+  {
+    "codeHex": "0xFF03",
+    "name": "Positive Limit Switch Error",
+    "category": "센서",
+    "causes": [
+      "정방향 리미트 스위치(Positive Limit Switch) 인식"
+    ],
+    "actions": [
+      "속도/위치 명령으로 스위치가 인식되는지 확인",
+      "스위치 결선 상태 및 Active High/Low 설정 확인"
+    ]
+  },
+  {
+    "codeHex": "0xFF04",
+    "name": "Negative Limit Switch Error",
+    "category": "센서",
+    "causes": [
+      "역방향 리미트 스위치(Negative Limit Switch) 인식"
+    ],
+    "actions": [
+      "속도/위치 명령으로 스위치가 인식되는지 확인",
+      "스위치 결선 상태 및 Active High/Low 설정 확인"
+    ]
+  },
+  {
+    "codeHex": "0xFF05",
+    "name": "Emergency Switch Error",
+    "category": "STO",
+    "causes": [
+      "STO 신호가 Active됨"
+    ],
+    "actions": [
+      "STO 결선 상태 확인",
+      "STO 설정이 Active High/Low인지 확인"
+    ]
+  },
+  {
+    "codeHex": "0xFF06",
+    "name": "STO1 Error",
+    "category": "STO",
+    "causes": [
+      "STO1에 입력된 신호가 Low",
+      "STO1에 High(24V) 신호가 입력되지 않음"
+    ],
+    "actions": [
+      "STO1에 High(24V) 신호가 정상적으로 입력되는지 확인"
+    ]
+  },
+  {
+    "codeHex": "0xFF07",
+    "name": "STO2 Error",
+    "category": "STO",
+    "causes": [
+      "STO2에 입력된 신호가 Low",
+      "STO2에 High(24V) 신호가 입력되지 않음"
+    ],
+    "actions": [
+      "STO2에 High(24V) 신호가 정상적으로 입력되는지 확인"
+    ]
+  },
+  {
+    "codeHex": "0xFF24",
+    "name": "Serial Encoder Channel A Error",
+    "category": "인코더",
+    "causes": [
+      "시리얼 엔코더 데이터의 에러 비트 활성화",
+      "시리얼 엔코더 제조사에서 정의한 에러 발생"
+    ],
+    "actions": [
+      "시리얼 엔코더 제조사 매뉴얼 확인"
+    ]
+  },
+  {
+    "codeHex": "0xFF25",
+    "name": "Serial Encoder Channel A Disconnection Error",
+    "category": "인코더",
+    "causes": [
+      "시리얼 엔코더로부터 데이터를 받지 못함",
+      "시리얼 엔코더 결선 문제"
+    ],
+    "actions": [
+      "시리얼 엔코더 A 포트의 결선 상태 확인"
+    ]
+  },
+  {
+    "codeHex": "0xFF26",
+    "name": "Serial Encoder Channel B Error",
+    "category": "인코더",
+    "causes": [
+      "시리얼 엔코더 데이터의 에러 비트 활성화",
+      "시리얼 엔코더 제조사에서 정의한 에러 발생"
+    ],
+    "actions": [
+      "시리얼 엔코더 제조사 매뉴얼 확인"
+    ]
+  },
+  {
+    "codeHex": "0xFF27",
+    "name": "Serial Encoder Channel B Disconnection Error",
+    "category": "인코더",
+    "causes": [
+      "시리얼 엔코더로부터 데이터를 받지 못함",
+      "시리얼 엔코더 결선 문제"
+    ],
+    "actions": [
+      "시리얼 엔코더 B 포트의 결선 상태 확인"
+    ]
+  }
+]

@@ -1,0 +1,488 @@
+﻿[
+  {
+    "codeHex": "0x7500",
+    "vendorCode": "E-500",
+    "name": "EtherCAT 통신 오류",
+    "category": "통신",
+    "causes": [
+      "EtherCAT 통신 중 오류 발생"
+    ],
+    "actions": [
+      "EtherCAT 마스터 상태 확인",
+      "EtherCAT 케이블 연결 상태 점검",
+      "노이즈 문제 발생 시 노이즈 대책 실시"
+    ]
+  },
+  {
+    "codeHex": "0xFF01",
+    "vendorCode": "E-001",
+    "name": "과전류 이상",
+    "category": "전류",
+    "causes": [
+      "모터 구동 소자에 과도한 전류 발생"
+    ],
+    "actions": [
+      "모터선 단락 상태 확인 후 이상 시 모터 교체",
+      "조치 후에도 알람 발생 시 드라이브 교체"
+    ]
+  },
+  {
+    "codeHex": "0xFF02",
+    "vendorCode": "E-002",
+    "name": "과속도 이상",
+    "category": "속도",
+    "causes": [
+      "모터 구동 속도가 3,000 r/min 초과"
+    ],
+    "actions": [
+      "마스터의 속도 지령값 확인 후 낮게 설정"
+    ]
+  },
+  {
+    "codeHex": "0xFF03",
+    "vendorCode": "E-003",
+    "name": "위치 추종 이상",
+    "category": "위치",
+    "causes": [
+      "위치 명령값과 실제 위치값의 차이가 설정값 초과"
+    ],
+    "actions": [
+      "기구부, 브레이크, 베어링, 인코더 케이블 상태 점검",
+      "충격 발생 원인 제거",
+      "위치 오차 검출값 조정"
+    ]
+  },
+  {
+    "codeHex": "0xFF04",
+    "vendorCode": "E-004",
+    "name": "과부하 이상",
+    "category": "부하",
+    "causes": [
+      "모터의 최대 토크를 초과하는 부하가 5초 이상 지속"
+    ],
+    "actions": [
+      "상위 제어기 명령 범위 확인",
+      "기구부 상태 및 H/W 리밋 센서 점검",
+      "부하 대비 토크 부족 시 모터 교체 또는 속도 조정"
+    ]
+  },
+  {
+    "codeHex": "0xFF05",
+    "vendorCode": "E-005",
+    "name": "과열 이상",
+    "category": "온도",
+    "causes": [
+      "드라이브 내부 온도가 85℃ 초과"
+    ],
+    "actions": [
+      "냉각팬 설치 또는 드라이브 간 간격 확보",
+      "조치 후에도 알람 발생 시 드라이브 교체"
+    ]
+  },
+  {
+    "codeHex": "0xFF06",
+    "vendorCode": "E-006",
+    "name": "회생 전압 이상",
+    "category": "전압",
+    "causes": [
+      "모터의 역기전력 상승으로 구동 전압 한계값 초과"
+    ],
+    "actions": [
+      "가감속 시간 또는 구동 속도 조정",
+      "조치 후에도 알람 발생 시 드라이브 교체"
+    ]
+  },
+  {
+    "codeHex": "0xFF07",
+    "vendorCode": "E-007",
+    "name": "모터 접속 이상",
+    "category": "연결",
+    "causes": [
+      "드라이브와 모터의 연결 이상"
+    ],
+    "actions": [
+      "모터상 단선, 모터 케이블 접속, 커넥터 배선 상태 점검",
+      "조치 후에도 알람 발생 시 드라이브 교체"
+    ]
+  },
+  {
+    "codeHex": "0xFF08",
+    "vendorCode": "E-008",
+    "name": "인코더 접속 이상",
+    "category": "연결",
+    "causes": [
+      "드라이브와 인코더의 연결 이상"
+    ],
+    "actions": [
+      "인코더 커넥터 및 케이블 접속 상태 확인",
+      "인코더 이상 시 모터 교체"
+    ]
+  },
+  {
+    "codeHex": "0xFF0A",
+    "vendorCode": "E-010",
+    "name": "인포지션 이상",
+    "category": "위치",
+    "causes": [
+      "운전 완료 후 설정값을 초과하는 위치 오차가 3초 이상 지속"
+    ],
+    "actions": [
+      "기구부 상태 및 벨트 텐션 조정",
+      "모터 및 인코더 케이블 배선 상태 확인 및 수정"
+    ]
+  },
+  {
+    "codeHex": "0xFF0C",
+    "vendorCode": "E-012",
+    "name": "ROM 이상",
+    "category": "메모리",
+    "causes": [
+      "파라미터 저장장치(ROM) 이상 발생"
+    ],
+    "actions": [
+      "알람 지속 발생 시 드라이브 교체"
+    ]
+  },
+  {
+    "codeHex": "0xFF0F",
+    "vendorCode": "E-015",
+    "name": "위치 오차 초과 이상",
+    "category": "위치",
+    "causes": [
+      "운전 완료 후 설정값 이상의 위치 오차 발생"
+    ],
+    "actions": [
+      "부하 대비 토크 부족 시 모터 교체 또는 속도 조정",
+      "인코더 및 브레이크 케이블 점검",
+      "기구부 충격 원인 제거"
+    ]
+  },
+  {
+    "codeHex": "0xFF31",
+    "vendorCode": "E-049",
+    "name": "드라이브 알람 발생",
+    "category": "드라이브",
+    "causes": [
+      "드라이브에 기타 알람 발생"
+    ],
+    "actions": [
+      "알람 지속 발생 시 드라이브 교체"
+    ]
+  },
+  {
+    "codeHex": "0xFF32",
+    "vendorCode": "E-050",
+    "name": "타임아웃 에러",
+    "category": "통신",
+    "causes": [
+      "타임아웃 에러 발생"
+    ],
+    "actions": [
+      "알람 지속 발생 시 드라이브 교체"
+    ]
+  },
+  {
+    "codeHex": "0xFF34",
+    "vendorCode": "E-052",
+    "name": "드라이브 내부 통신 이상",
+    "category": "통신",
+    "causes": [
+      "CRC 에러 발생"
+    ],
+    "actions": [
+      "알람 지속 발생 시 드라이브 교체"
+    ]
+  },
+  {
+    "codeHex": "0xFF35",
+    "vendorCode": "E-053",
+    "name": "드라이브 내부 통신 이상",
+    "category": "통신",
+    "causes": [
+      "명령이 제대로 실행되지 않음"
+    ],
+    "actions": [
+      "알람 지속 발생 시 드라이브 교체"
+    ]
+  },
+  {
+    "codeHex": "0xFF3C",
+    "vendorCode": "E-060",
+    "name": "Servo enable 명령 실행 오류",
+    "category": "명령",
+    "causes": [
+      "Servo enable 명령이 제대로 실행되지 않음"
+    ],
+    "actions": [
+      "알람 지속 발생 시 드라이브 교체"
+    ]
+  },
+  {
+    "codeHex": "0xFF3D",
+    "vendorCode": "E-061",
+    "name": "Push 명령 실행 오류",
+    "category": "명령",
+    "causes": [
+      "Push 명령이 제대로 실행되지 않음"
+    ],
+    "actions": [
+      "알람 지속 발생 시 드라이브 교체"
+    ]
+  },
+  {
+    "codeHex": "0xFF3E",
+    "vendorCode": "E-062",
+    "name": "세이프티 기능 TQOFF Input 미해제",
+    "category": "세이프티",
+    "causes": [
+      "세이프티 기능 동작 중에 Servo enable 명령 호출"
+    ],
+    "actions": [
+      "세이프티 기능이 동작하지 않는 상태에서 Servo enable 명령 실행"
+    ]
+  },
+  {
+    "codeHex": "0xFF3F",
+    "vendorCode": "E-063",
+    "name": "드라이브 SVOFF 발생",
+    "category": "드라이브",
+    "causes": [
+      "드라이브가 스스로 Servo disable 상태가 됨"
+    ],
+    "actions": [
+      "알람 지속 발생 시 드라이브 교체"
+    ]
+  },
+  {
+    "codeHex": "0xFF41",
+    "vendorCode": "E-065",
+    "name": "Servo enable 실패",
+    "category": "명령",
+    "causes": [
+      "Servo enable 과정에서 인포지션 신호가 불안정하거나 감지되지 않음"
+    ],
+    "actions": [
+      "모터 장착 기구물에서 발생하는 진동 또는 외력의 근본 원인 제거"
+    ]
+  },
+  {
+    "codeHex": "0xFF42",
+    "vendorCode": "E-066",
+    "name": "드라이브 Servo disable 실패",
+    "category": "명령",
+    "causes": [
+      "Servo disable 과정에서 드라이브의 SVOFF 신호가 인식되지 않음"
+    ],
+    "actions": [
+      "알람 지속 발생 시 드라이브 교체"
+    ]
+  },
+  {
+    "codeHex": "0xFF43",
+    "vendorCode": "E-067",
+    "name": "원점복귀 실패",
+    "category": "명령",
+    "causes": [
+      "원점복귀 과정에서 인포지션 신호가 불안정하거나 감지되지 않음"
+    ],
+    "actions": [
+      "원점복귀 과정에서 발생하는 진동 또는 외력의 근본 원인 제거"
+    ]
+  },
+  {
+    "codeHex": "0xFF44",
+    "vendorCode": "E-068",
+    "name": "CSP 속도 제한 이상",
+    "category": "속도",
+    "causes": [
+      "CSP 모드에서 입력된 속도값이 제한 속도 초과"
+    ],
+    "actions": [
+      "마스터의 속도 지령값 확인 후 높을 경우 낮게 설정"
+    ]
+  },
+  {
+    "codeHex": "0xFF45",
+    "vendorCode": "E-069",
+    "name": "Safety 활성화",
+    "category": "세이프티",
+    "causes": [
+      "세이프티 기능이 활성화되어 드라이브가 Servo disable 상태가 됨"
+    ],
+    "actions": [
+      "세이프티 기능 활성화 시 알람이 발생하지 않도록 설정 변경 (Advanced settings → 서보인덱스 5 → 값 0으로 설정)"
+    ]
+  },
+  {
+    "codeHex": "0xFF46",
+    "vendorCode": "E-070",
+    "name": "인코더 계수 오류",
+    "category": "인코더",
+    "causes": [
+      "인코더 입력신호 이상으로 정상적인 측정 불가"
+    ],
+    "actions": [
+      "기구물 진동/외력 발생 시 Encoder count error(2031h)의 서브인덱스 2 값 조정",
+      "Following error actual value(60F4h) 값 증가 시 드라이브와 인코더 커넥터 연결 상태 확인",
+      "인코더 이상 시 모터 교체"
+    ]
+  },
+  {
+    "codeHex": "0xFF47",
+    "vendorCode": "E-071",
+    "name": "네트워크 초기화 오류",
+    "category": "통신",
+    "causes": [
+      "EtherCAT 통신용 EEPROM에 잘못된 값이 기록되어 H/W 초기화 중 오류 발생"
+    ],
+    "actions": [
+      "EtherCAT 마스터를 이용해 EEPROM에 저장된 값 변경"
+    ]
+  },
+  {
+    "codeHex": "0xFF49",
+    "vendorCode": "E-073",
+    "name": "동기화 타입 오류",
+    "category": "통신",
+    "causes": [
+      "DC Sync 모드가 아닌 상태에서 CSP 모드 사용"
+    ],
+    "actions": [
+      "EtherCAT 마스터를 이용해 드라이브 동기화 방식을 DC Sync 모드로 설정"
+    ]
+  },
+  {
+    "codeHex": "0xFF4B",
+    "vendorCode": "E-075",
+    "name": "비정상 세이프티 상태",
+    "category": "세이프티",
+    "causes": [
+      "TQOFF Input에 할당된 두 입력신호가 다름"
+    ],
+    "actions": [
+      "세이프티 미사용 시 Safety mode(2040h)의 서브인덱스 2 값을 0으로 설정",
+      "세이프티 사용 시 Digital In1/In2 센서 상태 동일 여부 및 케이블 연결 상태 확인"
+    ]
+  },
+  {
+    "codeHex": "0xFF4C",
+    "vendorCode": "E-076",
+    "name": "드라이브 내부 통신 불량",
+    "category": "통신",
+    "causes": [
+      "통신 시작 불가"
+    ],
+    "actions": [
+      "알람 지속 발생 시 드라이브 교체"
+    ]
+  },
+  {
+    "codeHex": "0xFF64",
+    "vendorCode": "E-100",
+    "name": "ROM 이상",
+    "category": "메모리",
+    "causes": [
+      "ROM에 파라미터가 정상적으로 저장되지 않음"
+    ],
+    "actions": [
+      "알람 지속 발생 시 드라이브 교체"
+    ]
+  },
+  {
+    "codeHex": "0xFF65",
+    "vendorCode": "E-101",
+    "name": "ROM 이상",
+    "category": "메모리",
+    "causes": [
+      "ROM의 체크섬 불일치"
+    ],
+    "actions": [
+      "알람 지속 발생 시 드라이브 교체"
+    ]
+  },
+  {
+    "codeHex": "0xFF66",
+    "vendorCode": "E-102",
+    "name": "ROM 이상",
+    "category": "메모리",
+    "causes": [
+      "FRAM에서 데이터 읽기 오류 발생"
+    ],
+    "actions": [
+      "알람 지속 발생 시 드라이브 교체"
+    ]
+  },
+  {
+    "codeHex": "0xFF6E",
+    "vendorCode": "E-110",
+    "name": "ROM 이상",
+    "category": "메모리",
+    "causes": [
+      "ROM에서 데이터 읽기 오류 발생"
+    ],
+    "actions": [
+      "알람 지속 발생 시 드라이브 교체"
+    ]
+  },
+  {
+    "codeHex": "0xFF79",
+    "vendorCode": "E-121",
+    "name": "ROM 이상",
+    "category": "메모리",
+    "causes": [
+      "ROM에 데이터 쓰기 오류 발생 (1)"
+    ],
+    "actions": [
+      "알람 지속 발생 시 드라이브 교체"
+    ]
+  },
+  {
+    "codeHex": "0xFF7A",
+    "vendorCode": "E-122",
+    "name": "ROM 이상",
+    "category": "메모리",
+    "causes": [
+      "ROM에 데이터 쓰기 오류 발생 (2)"
+    ],
+    "actions": [
+      "알람 지속 발생 시 드라이브 교체"
+    ]
+  },
+  {
+    "codeHex": "0xFF7B",
+    "vendorCode": "E-123",
+    "name": "ROM 이상",
+    "category": "메모리",
+    "causes": [
+      "ROM에 데이터 쓰기 오류 발생 (3)"
+    ],
+    "actions": [
+      "알람 지속 발생 시 드라이브 교체"
+    ]
+  },
+  {
+    "codeHex": "0xFF7C",
+    "vendorCode": "E-124",
+    "name": "ROM 이상",
+    "category": "메모리",
+    "causes": [
+      "ROM에 데이터 쓰기 오류 발생 (4)"
+    ],
+    "actions": [
+      "알람 지속 발생 시 드라이브 교체"
+    ]
+  },
+  {
+    "codeHex": "0xFFC8",
+    "vendorCode": "E-200",
+    "name": "ROM 데이터 범위 이상",
+    "category": "메모리",
+    "causes": [
+      "ROM에 저장된 파라미터 값이 범위를 벗어남"
+    ],
+    "actions": [
+      "모든 파라미터 초기화",
+      "알람 지속 발생 시 드라이브 교체"
+    ]
+  }
+]
