@@ -1254,7 +1254,7 @@ static inline unsigned char CalcPosTravelCode()
 // Axis2 리밋 센서 현재 상태
 static inline bool IsAxis2LimitOn()
 {
-	return g_ax2LimitOn.load();
+	return ReadInputBit(AX2_LIMIT_ADDR, AX2_LIMIT_BIT, AX2_LIMIT_ACTIVE_HIGH);
 }
 
 // Auto 모드일 때만 적용되는 인터락: Axis0(주행) 시작 가능 여부
@@ -1305,7 +1305,7 @@ static bool CheckInterlockBeforeAxisCommand(int axis)
 static bool StartRelMoveWithProfile(int axis, long long delta, double vpps, double tAcc, double tDec) {
 
 	// Axis0/Axis2 인터락
-	if (!CheckInterlockBeforeAxisCommand(axis)) return false;
+	//if (!CheckInterlockBeforeAxisCommand(axis)) return false;
 
 	g_cm.GetStatus(&g_status);
 	long long cur = (long long)g_status.axesStatus[axis].actualPos;
@@ -1608,7 +1608,7 @@ static bool StartMultiJog(HWND hWnd, int sign) {
 
 		// Auto 모드 인터락: Axis0/2에만 적용
 		if (g_autoMode.load()) {
-			if (!CheckInterlockBeforeAxisCommand(a)) continue;
+			//if (!CheckInterlockBeforeAxisCommand(a)) continue;
 		}
 
 		// Axis2 보호: 리밋 ON시 -방향 JOG 차단
@@ -1701,7 +1701,7 @@ static void DoToggleEStop(HWND hWnd, bool syncWindow)
 bool StartAbsMoveWithProfile(int axis, long long target, double vpps, double tAcc, double tDec) {
 
 	// Auto 모드 인터락: Axis0/2 이동 전 검사
-	if (!CheckInterlockBeforeAxisCommand(axis)) return false;
+	//if (!CheckInterlockBeforeAxisCommand(axis)) return false;
 
 	// Axis2 보호 체크: 리밋 ON시 -방향 금지
 	if (axis == 2 && g_commStarted) {
@@ -2628,7 +2628,7 @@ void TcpServerThreadProc()
 						AppendLog(okTravel
 							? L"[ACT] Travel Pos1 -> Conveyor DONE"
 							: L"[ACT] Travel Pos1 -> Conveyor FAILED or TIMEOUT");
-						if(okTravel)
+						if (okTravel)
 							ToggleDO_HW(11, false, nullptr);
 						break;
 					case 2:
@@ -2703,7 +2703,7 @@ void TcpServerThreadProc()
 						if (okHoist)
 							ToggleDO_HW(11, false, nullptr);
 						break;
-						
+
 					case 2:
 						AppendLog(L"[ACT] Hoist Pos2 -> Work Down");
 						ToggleDO_HW(11, true, nullptr);
@@ -2715,7 +2715,7 @@ void TcpServerThreadProc()
 						if (okHoist)
 							ToggleDO_HW(11, false, nullptr);
 						break;
-						
+
 					case 3:
 						AppendLog(L"[ACT] Hoist Pos3 -> Up Position");
 						ToggleDO_HW(11, true, nullptr);
@@ -2727,7 +2727,7 @@ void TcpServerThreadProc()
 						if (okHoist)
 							ToggleDO_HW(11, false, nullptr);
 						break;
-						
+
 					default:
 						AppendLog(L"[WARN] Hoist Position invalid PosNo");
 						okHoist = false;
@@ -2791,7 +2791,7 @@ void TcpServerThreadProc()
 						AppendLog(L"[ACT] Grip Pos1 -> GripOpen");
 						g_gripBusy = true;
 
-				
+
 						ToggleDO_HW(11, motioning, nullptr);
 						DoOpen_Compat(nullptr);
 						okGrip = WaitUntil(IsGripperOpenAndIdle, 10000);
@@ -2813,7 +2813,7 @@ void TcpServerThreadProc()
 						AppendLog(L"[ACT] Grip Pos2 -> GripClose");
 						g_gripBusy = true;
 
-						
+
 						ToggleDO_HW(11, motioning, nullptr);
 						DoClose_Compat(nullptr);
 						okGrip = WaitUntil(IsGripperClosedAndIdle, 10000);
@@ -5998,8 +5998,8 @@ static void AutoStart(HWND hWnd)
 	}*/
 
 	// Servo ON
-	/*EnsureServoOn(0);
-	EnsurePosModeNoStop(0);*/
+	EnsureServoOn(0);
+	EnsurePosModeNoStop(0);
 
 	//// 5초 대기
 	//std::this_thread::sleep_for(std::chrono::seconds(5));
@@ -6008,11 +6008,11 @@ static void AutoStart(HWND hWnd)
 	//EnsurePosModeNoStop(1);
 
 	// 5초 대기
-	//std::this_thread::sleep_for(std::chrono::seconds(5));
+	std::this_thread::sleep_for(std::chrono::seconds(5));
 
 	// 그 다음 2번 서보 ON
-	//EnsureServoOn(2);
-	//EnsurePosModeNoStop(2);
+	EnsureServoOn(2);
+	EnsurePosModeNoStop(2);
 
 	//// Sync Group 0: Master=0, Slave=[1]
 	//if (g_commStarted) {
@@ -6048,7 +6048,7 @@ static void AutoStart(HWND hWnd)
 	//		g_cm.sync->EnableSyncGroup(0, 1);
 	//	}
 	//}
-	
+
 	PostMessage(hWnd, WM_APP_SHOW_DEMO_MIN, 0, 0);
 
 	UpdateEStopUi(hWnd, false);
@@ -6120,7 +6120,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 			}, hWnd).detach();
 
-		
+
 
 	}
 	return 0;
