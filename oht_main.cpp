@@ -2310,6 +2310,11 @@ extern bool WaitTaskFinished(TaskId id, DWORD timeoutMs, DWORD pollMs);
 
 std::atomic<bool> g_motionBusy{ false };
 
+// DONE(0x21, 0x22)에 대한 ACK 수신 여부
+std::atomic<bool> g_ackLoadDone{ false };
+std::atomic<bool> g_ackUnloadDone{ false };
+
+
 void TcpServerThreadProc()
 {
 	WSADATA wsa{};
@@ -2442,13 +2447,40 @@ void TcpServerThreadProc()
 					bool okLoad = WaitTaskFinished(TaskId::DemoLoad, 120000);
 					if (!okLoad) {
 						AppendLog(L"[WARN] Load sequence timeout or failed");
+						ToggleDO_HW(11, false, nullptr);
+						g_motionBusy.store(false);
+						return;
 						// 실패시 Done은 보내지 않음 (현재 정책)
 					}
 					else {
 						ToggleDO_HW(11, false, nullptr);
 						AppendLog(L"[ACT] Load action complete (OK)");
+						// ACK 플래그 초기화
+						g_ackLoadDone.store(false, std::memory_order_relaxed);
 						SendSimpleDone(sockLoad, 0x21);
 						AppendLog(L"[TX] Load Done sent");
+
+						DWORD lastSend = GetTickCount();
+
+						while (g_tcpRunning.load()) {
+							// PLC에서 ACK(0xFF, payload=0x21)를 받으면 g_ackLoadDone = true
+							if (g_ackLoadDone.load(std::memory_order_relaxed)) {
+								AppendLog(L"[INFO] Load Done ACK received from PLC");
+								break;
+							}
+
+							DWORD now = GetTickCount();
+							if (now - lastSend >= 2000) {
+								// 2초 동안 ACK를 못 받으면 Done 다시 전송
+								AppendLog(L"[WARN] Load Done ACK not received, resending...");
+								SendSimpleDone(sockLoad, 0x21);
+								AppendLog(L"[TX] Load Done re-sent");
+								lastSend = now;
+								// g_ackLoadDone 는 ACK 올 때만 true로 바뀜
+							}
+
+							::Sleep(50);
+						}
 					}
 
 					g_motionBusy.store(false);
@@ -2480,12 +2512,35 @@ void TcpServerThreadProc()
 					bool okUnload = WaitTaskFinished(TaskId::DemoUnload, 60000);
 					if (!okUnload) {
 						AppendLog(L"[WARN] Unload sequence timeout or failed");
+						ToggleDO_HW(11, false, nullptr);
+						g_motionBusy.store(false);
+						return;
 					}
 					else {
 						ToggleDO_HW(11, false, nullptr);
 						AppendLog(L"[ACT] Unload action complete (OK)");
+						g_ackUnloadDone.store(false, std::memory_order_relaxed);
 						SendSimpleDone(sockUnload, 0x22);
 						AppendLog(L"[TX] Unload Done sent");
+
+						DWORD lastSend = GetTickCount();
+
+						while (g_tcpRunning.load()) {
+							if (g_ackUnloadDone.load(std::memory_order_relaxed)) {
+								AppendLog(L"[INFO] Unload Done ACK received from PLC");
+								break;
+							}
+
+							DWORD now = GetTickCount();
+							if (now - lastSend >= 2000) {
+								AppendLog(L"[WARN] Unload Done ACK not received, resending...");
+								SendSimpleDone(sockUnload, 0x22);
+								AppendLog(L"[TX] Unload Done re-sent");
+								lastSend = now;
+							}
+
+							::Sleep(50);
+						}
 					}
 
 					g_motionBusy.store(false);
@@ -2645,9 +2700,10 @@ void TcpServerThreadProc()
 						AppendLog(okHoist
 							? L"[ACT] Hoist Pos1 -> ConveyorDown DONE"
 							: L"[ACT] Hoist Pos1 -> ConveyorDown FAILED or TIMEOUT");
-						break;
-						if(okHoist)
+						if (okHoist)
 							ToggleDO_HW(11, false, nullptr);
+						break;
+						
 					case 2:
 						AppendLog(L"[ACT] Hoist Pos2 -> Work Down");
 						ToggleDO_HW(11, true, nullptr);
@@ -2656,9 +2712,10 @@ void TcpServerThreadProc()
 						AppendLog(okHoist
 							? L"[ACT] Hoist Pos2 -> WorkDown DONE"
 							: L"[ACT] Hoist Pos2 -> WorkDown FAILED or TIMEOUT");
-						break;
 						if (okHoist)
 							ToggleDO_HW(11, false, nullptr);
+						break;
+						
 					case 3:
 						AppendLog(L"[ACT] Hoist Pos3 -> Up Position");
 						ToggleDO_HW(11, true, nullptr);
@@ -2667,9 +2724,10 @@ void TcpServerThreadProc()
 						AppendLog(okHoist
 							? L"[ACT] Hoist Pos3 -> Up DONE"
 							: L"[ACT] Hoist Pos3 -> Up FAILED or TIMEOUT");
-						break;
 						if (okHoist)
 							ToggleDO_HW(11, false, nullptr);
+						break;
+						
 					default:
 						AppendLog(L"[WARN] Hoist Position invalid PosNo");
 						okHoist = false;
@@ -2733,12 +2791,11 @@ void TcpServerThreadProc()
 						AppendLog(L"[ACT] Grip Pos1 -> GripOpen");
 						g_gripBusy = true;
 
-						DoGripServoOff_Compat(nullptr); // 서보 오프
+				
 						ToggleDO_HW(11, motioning, nullptr);
 						DoOpen_Compat(nullptr);
 						okGrip = WaitUntil(IsGripperOpenAndIdle, 10000);
 						ToggleDO_HW(11, motioning, nullptr);
-						DoGripServoOff_Compat(nullptr); // 서보 오프
 
 						g_gripBusy = false;
 						AppendLog(okGrip
@@ -2756,12 +2813,11 @@ void TcpServerThreadProc()
 						AppendLog(L"[ACT] Grip Pos2 -> GripClose");
 						g_gripBusy = true;
 
-						DoGripServoOff_Compat(nullptr); // 서보 오프
+						
 						ToggleDO_HW(11, motioning, nullptr);
 						DoClose_Compat(nullptr);
 						okGrip = WaitUntil(IsGripperClosedAndIdle, 10000);
 						ToggleDO_HW(11, motioning, nullptr);
-						DoGripServoOff_Compat(nullptr); // 서보 오프
 						g_gripBusy = false;
 
 						AppendLog(okGrip
@@ -2797,6 +2853,10 @@ void TcpServerThreadProc()
 						ackFor, DecodeOpName(ackFor));
 					AppendLog(info);
 				}
+				// ★ Load / Unload 두 쪽 다 깨워줌
+				// (동시에 둘 다 돌지 않게 g_motionBusy로 막아놨으므로 안전)
+				g_ackLoadDone.store(true, std::memory_order_relaxed);
+				g_ackUnloadDone.store(true, std::memory_order_relaxed);
 				return true;
 
 				// ---------------- 기타 ----------------
@@ -6041,11 +6101,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			Sleep(500);
 			AutoStart(hMain);
 			// 창이 열릴 때 STO 펄스 1회 (오류 클리어)
-			DoGripServoOff_Compat(hMain);
+			//DoGripServoOff_Compat(hMain);
 			// AutoStart 후 TCP 시작 (원하면)
 			StartTcpServer();
 
-			ToggleDO_HW(11, false, hMain); // STO 펄스 1회 (오류 클리어)
 			bool okGrip = false;
 			// ★ 여기 조건문
 			if (HasBox()) {             // <- 괄호 꼭!

@@ -310,7 +310,7 @@ struct MoveMonitorArgs {
     double posEps = 10.0;
     double velEps = 2.0;
     DWORD timeoutMs = 15000;
-	bool treatStoppedAsDone = false;
+    bool treatStoppedAsDone = false;
 };
 static void StartMoveAndMonitor(const MoveMonitorArgs& m, double vpps, double accMs, double decMs) {
     if (!g_commStarted) { SetTaskState(m.task, TaskState::Failed); return; }
@@ -997,6 +997,9 @@ static void UpdateDIText(int i, bool supported, bool level, HWND hWnd) {
     else _stprintf_s(buf, _T("Pin %d : %s"), i, showLevel ? _T("OFF") : _T("ON"));
     SetWindowText(g_lblDI[i], buf);
 }
+
+static bool s_servoOffHandledOnce = false;
+
 static void RefreshInputsWithDebounce(HWND hWnd) {
     uint32_t diNow = 0;
     if (!SampleDI_Once(diNow)) return;
@@ -1043,18 +1046,27 @@ static void RefreshInputsWithDebounce(HWND hWnd) {
                     SetTaskState(TaskId::GripClose, TaskState::Done);
                 }
             }
-            // ★ 추가: GripServoOff 가 Done 이면 GripOpen/GripClose 도 Done 으로 정리
-            TaskState servoOffState = g_taskStatus[(int)TaskId::GripServoOff].state.load();
-            if (servoOffState == TaskState::Done) {
+            // ★ 추가: 프로그램 전체에서 딱 1번만 GripServoOff 상태를 보고
+            //         GripOpen / GripClose 를 Done 으로 맞춰준다.
+            if (!s_servoOffHandledOnce) {
+                TaskState servoOffState =
+                    g_taskStatus[(int)TaskId::GripServoOff].state.load();
+                if (servoOffState == TaskState::Done) {
 
-                TaskState openState = g_taskStatus[(int)TaskId::GripOpen].state.load();
-                if (openState == TaskState::Running) {
-                    SetTaskState(TaskId::GripOpen, TaskState::Done);
-                }
+                    TaskState openState =
+                        g_taskStatus[(int)TaskId::GripOpen].state.load();
+                    if (openState == TaskState::Running) {
+                        SetTaskState(TaskId::GripOpen, TaskState::Done);
+                    }
 
-                TaskState closeState = g_taskStatus[(int)TaskId::GripClose].state.load();
-                if (closeState == TaskState::Running) {
-                    SetTaskState(TaskId::GripClose, TaskState::Done);
+                    TaskState closeState =
+                        g_taskStatus[(int)TaskId::GripClose].state.load();
+                    if (closeState == TaskState::Running) {
+                        SetTaskState(TaskId::GripClose, TaskState::Done);
+                    }
+
+                    // ★ 한 번 처리했으니 다시는 안 하도록 플래그 ON
+                    s_servoOffHandledOnce = true;
                 }
             }
 
@@ -1607,11 +1619,11 @@ void DoOpen_Compat(HWND hWnd)
     // 그리퍼 Open 명령 시작
     SetTaskState(TaskId::GripOpen, TaskState::Running);
 
-    
- //   // 1) STO 펄스 (10번: ON → 타이머로 자동 OFF)
-	//DoGripServoOff_Compat(hWnd);
 
-    // 2) Close OFF
+    //   // 1) STO 펄스 (10번: ON → 타이머로 자동 OFF)
+       //DoGripServoOff_Compat(hWnd);
+
+       // 2) Close OFF
     ToggleDO_HW(9, false, hWnd);
     SetTaskState(TaskId::GripClose, TaskState::Idle);
 
@@ -1619,7 +1631,7 @@ void DoOpen_Compat(HWND hWnd)
     ToggleDO_HW(8, false, hWnd);
     ToggleDO_HW(8, true, hWnd);   // 이 상태가 계속 유지 → Open 상태
 
-	//DoGripServoOff_Compat(hWnd);
+    //DoGripServoOff_Compat(hWnd);
 }
 
 void DoClose_Compat(HWND hWnd)
@@ -1628,7 +1640,7 @@ void DoClose_Compat(HWND hWnd)
     SetTaskState(TaskId::GripClose, TaskState::Running);
 
     // 1) STO 펄스
-	//DoGripServoOff_Compat(hWnd);
+    //DoGripServoOff_Compat(hWnd);
 
     // 2) Open OFF
     ToggleDO_HW(8, false, hWnd);
@@ -1637,8 +1649,8 @@ void DoClose_Compat(HWND hWnd)
     // 3) Close 신호: 9번을 한번 OFF 했다가 ON (에지 만들기)
     ToggleDO_HW(9, false, hWnd);
     ToggleDO_HW(9, true, hWnd);   // 이 상태 유지 → Close 상태
-	//DoGripServoOff_Compat(hWnd);
-    
+    //DoGripServoOff_Compat(hWnd);
+
 }
 
 void DoGripServoOff_Compat(HWND hWnd) {
@@ -2019,10 +2031,10 @@ void StartDemoLoad()
                 ok = false;
         }
 
-		Sleep(1000);
+        Sleep(1000);
 
         SetTaskState(TaskId::DemoLoad, ok ? TaskState::Done : TaskState::Failed);
-    }).detach();
+        }).detach();
 }
 
 // Unload 시퀀스: Workstation → Conveyor
@@ -2092,7 +2104,7 @@ void StartDemoUnload()
             if (!WaitUntil(IsAxis0AtConveyorBarcodeStopped, 30000))
                 ok = false;
         }
-		Sleep(1000);
+        Sleep(1000);
 
         SetTaskState(TaskId::DemoUnload, ok ? TaskState::Done : TaskState::Failed);
         }).detach();
@@ -2347,6 +2359,7 @@ static LRESULT CALLBACK DemoWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     switch (msg) {
     case WM_CREATE: {
         g_hDemoWnd = hWnd;
+        s_servoOffHandledOnce = false;
         ResetAllTaskStates();
         Axis2SensorInit();
 
@@ -2383,7 +2396,7 @@ static LRESULT CALLBACK DemoWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         SetTimer(hWnd, IDT_GPIO_REFRESH, kPollIntervalMs, nullptr);
 
         // 창이 열릴 때 STO 펄스 1회 (오류 클리어)
-		DoGripServoOff_Compat(hWnd);
+        DoGripServoOff_Compat(hWnd);
 
         return 0;
     }
@@ -2419,7 +2432,7 @@ static LRESULT CALLBACK DemoWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
             // Open/Close는 STO 먼저
             if (on && (pin == 8 || pin == 9)) {
-				DoGripServoOff_Compat(g_hDemoWnd);
+                DoGripServoOff_Compat(g_hDemoWnd);
             }
             ToggleDO_HW(pin, on, g_hDemoWnd);
 
