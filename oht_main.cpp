@@ -68,6 +68,7 @@ extern "C" int RunGPIOWindowExternal(HINSTANCE hInst);
 // ==== DemoControl에서 제공하는 GPIO/그리퍼/상태 함수 extern ====
 // CHANGED: 아래 extern들은 democontrol 모듈의 함수를 창 없이도 호출하기 위해 필요
 extern void ToggleDO_HW(int pin, bool turnOn, HWND hWnd);
+extern void DoGripServoOff_Compat(HWND hWnd);
 extern bool EnumerateGPIO();
 extern bool PickBank_DI0_7_DO8_15();
 extern bool EnsureDO8to15AsOutput_BankFirst();
@@ -2435,6 +2436,7 @@ void TcpServerThreadProc()
 				SOCKET sockLoad = g_clientSock;
 				std::thread([sockLoad]() {
 					AppendLog(L"[ACT] Load Action Start");
+					ToggleDO_HW(11, true, nullptr);
 					StartDemoLoad(); // TaskId::DemoLoad 를 Running으로 세팅
 
 					bool okLoad = WaitTaskFinished(TaskId::DemoLoad, 120000);
@@ -2443,6 +2445,7 @@ void TcpServerThreadProc()
 						// 실패시 Done은 보내지 않음 (현재 정책)
 					}
 					else {
+						ToggleDO_HW(11, false, nullptr);
 						AppendLog(L"[ACT] Load action complete (OK)");
 						SendSimpleDone(sockLoad, 0x21);
 						AppendLog(L"[TX] Load Done sent");
@@ -2471,6 +2474,7 @@ void TcpServerThreadProc()
 				SOCKET sockUnload = g_clientSock;
 				std::thread([sockUnload]() {
 					AppendLog(L"[ACT] Unload Action Start");
+					ToggleDO_HW(11, true, nullptr);
 					StartDemoUnload();
 
 					bool okUnload = WaitTaskFinished(TaskId::DemoUnload, 60000);
@@ -2478,6 +2482,7 @@ void TcpServerThreadProc()
 						AppendLog(L"[WARN] Unload sequence timeout or failed");
 					}
 					else {
+						ToggleDO_HW(11, false, nullptr);
 						AppendLog(L"[ACT] Unload action complete (OK)");
 						SendSimpleDone(sockUnload, 0x22);
 						AppendLog(L"[TX] Unload Done sent");
@@ -2496,6 +2501,7 @@ void TcpServerThreadProc()
 				AppendLog(L"[TX] Stop Request ACK sent");
 
 				DoStopAll(nullptr);
+				ToggleDO_HW(11, false, nullptr);
 				AppendLog(L"[ACT] All axes QuickStop executed");
 
 				if (WaitAllAxesStopped(1.0, 10000)) {
@@ -2561,34 +2567,42 @@ void TcpServerThreadProc()
 					switch (posNo) {
 					case 1:
 						AppendLog(L"[ACT] Travel Pos1 -> Conveyor");
+						ToggleDO_HW(11, true, nullptr);
 						GO_Conveyor();
 						okTravel = WaitTaskFinished(TaskId::GoConveyor, 30000);
 						AppendLog(okTravel
 							? L"[ACT] Travel Pos1 -> Conveyor DONE"
 							: L"[ACT] Travel Pos1 -> Conveyor FAILED or TIMEOUT");
+						if(okTravel)
+							ToggleDO_HW(11, false, nullptr);
 						break;
 					case 2:
 						AppendLog(L"[ACT] Travel Pos2 -> Workstation");
+						ToggleDO_HW(11, true, nullptr);
 						Go_Workstation();
 						okTravel = WaitTaskFinished(TaskId::GoWorkstation, 30000);
 						AppendLog(okTravel
 							? L"[ACT] Travel Pos2 -> Workstation DONE"
 							: L"[ACT] Travel Pos2 -> Workstation FAILED or TIMEOUT");
+						if (okTravel)
+							ToggleDO_HW(11, false, nullptr);
 						break;
 					case 3:
+						ToggleDO_HW(11, false, nullptr);
 						AppendLog(L"[WARN] Travel Pos3 not implemented");
 						okTravel = false;
 						break;
 					default:
+						ToggleDO_HW(11, false, nullptr);
 						AppendLog(L"[WARN] Travel Position invalid PosNo");
 						okTravel = false;
 						break;
 					}
 
-					if (okTravel) {
+					/*if (okTravel) {
 						SendSimpleDone(sockTravel, 0x2A);
 						AppendLog(L"[TX] Travel Pos Done sent");
-					}
+					}*/
 
 					g_motionBusy.store(false);
 					}).detach();
@@ -2625,38 +2639,47 @@ void TcpServerThreadProc()
 					switch (posNo) {
 					case 1:
 						AppendLog(L"[ACT] Hoist Pos1 -> Conveyor Down");
+						ToggleDO_HW(11, true, nullptr);
 						ConveyorDown();
 						okHoist = WaitTaskFinished(TaskId::ConveyorDown, 20000);
 						AppendLog(okHoist
 							? L"[ACT] Hoist Pos1 -> ConveyorDown DONE"
 							: L"[ACT] Hoist Pos1 -> ConveyorDown FAILED or TIMEOUT");
 						break;
+						if(okHoist)
+							ToggleDO_HW(11, false, nullptr);
 					case 2:
 						AppendLog(L"[ACT] Hoist Pos2 -> Work Down");
+						ToggleDO_HW(11, true, nullptr);
 						WorkDown();
 						okHoist = WaitTaskFinished(TaskId::WorkDown, 20000);
 						AppendLog(okHoist
 							? L"[ACT] Hoist Pos2 -> WorkDown DONE"
 							: L"[ACT] Hoist Pos2 -> WorkDown FAILED or TIMEOUT");
 						break;
+						if (okHoist)
+							ToggleDO_HW(11, false, nullptr);
 					case 3:
 						AppendLog(L"[ACT] Hoist Pos3 -> Up Position");
+						ToggleDO_HW(11, true, nullptr);
 						DoUp();
 						okHoist = WaitTaskFinished(TaskId::LiftUp, 20000);
 						AppendLog(okHoist
 							? L"[ACT] Hoist Pos3 -> Up DONE"
 							: L"[ACT] Hoist Pos3 -> Up FAILED or TIMEOUT");
 						break;
+						if (okHoist)
+							ToggleDO_HW(11, false, nullptr);
 					default:
 						AppendLog(L"[WARN] Hoist Position invalid PosNo");
 						okHoist = false;
 						break;
 					}
 
-					if (okHoist) {
+					/*if (okHoist) {
 						SendSimpleDone(sockHoist, 0x2B);
 						AppendLog(L"[TX] Hoist Pos Done sent");
-					}
+					}*/
 
 					g_motionBusy.store(false);
 					}).detach();
@@ -2710,10 +2733,12 @@ void TcpServerThreadProc()
 						AppendLog(L"[ACT] Grip Pos1 -> GripOpen");
 						g_gripBusy = true;
 
+						DoGripServoOff_Compat(nullptr); // 서보 오프
 						ToggleDO_HW(11, motioning, nullptr);
 						DoOpen_Compat(nullptr);
 						okGrip = WaitUntil(IsGripperOpenAndIdle, 10000);
 						ToggleDO_HW(11, motioning, nullptr);
+						DoGripServoOff_Compat(nullptr); // 서보 오프
 
 						g_gripBusy = false;
 						AppendLog(okGrip
@@ -2730,8 +2755,13 @@ void TcpServerThreadProc()
 
 						AppendLog(L"[ACT] Grip Pos2 -> GripClose");
 						g_gripBusy = true;
+
+						DoGripServoOff_Compat(nullptr); // 서보 오프
+						ToggleDO_HW(11, motioning, nullptr);
 						DoClose_Compat(nullptr);
 						okGrip = WaitUntil(IsGripperClosedAndIdle, 10000);
+						ToggleDO_HW(11, motioning, nullptr);
+						DoGripServoOff_Compat(nullptr); // 서보 오프
 						g_gripBusy = false;
 
 						AppendLog(okGrip
@@ -6011,12 +6041,23 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			Sleep(500);
 			AutoStart(hMain);
 			// 창이 열릴 때 STO 펄스 1회 (오류 클리어)
-			ToggleDO_HW(10, true, hMain);
-
+			DoGripServoOff_Compat(hMain);
 			// AutoStart 후 TCP 시작 (원하면)
 			StartTcpServer();
 
 			ToggleDO_HW(11, false, hMain); // STO 펄스 1회 (오류 클리어)
+			bool okGrip = false;
+			// ★ 여기 조건문
+			if (HasBox()) {             // <- 괄호 꼭!
+				DoClose_Compat(hMain);  // <- 세미콜론 추가
+				okGrip = WaitUntil(IsGripperClosedAndIdle, 10000);
+				DoGripServoOff_Compat(hMain);
+			}
+			else {
+				DoOpen_Compat(hMain);
+				okGrip = WaitUntil(IsGripperOpenAndIdle, 10000);
+				DoGripServoOff_Compat(hMain);
+			}
 
 			}, hWnd).detach();
 

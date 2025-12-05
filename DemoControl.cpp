@@ -1043,6 +1043,20 @@ static void RefreshInputsWithDebounce(HWND hWnd) {
                     SetTaskState(TaskId::GripClose, TaskState::Done);
                 }
             }
+            // ★ 추가: GripServoOff 가 Done 이면 GripOpen/GripClose 도 Done 으로 정리
+            TaskState servoOffState = g_taskStatus[(int)TaskId::GripServoOff].state.load();
+            if (servoOffState == TaskState::Done) {
+
+                TaskState openState = g_taskStatus[(int)TaskId::GripOpen].state.load();
+                if (openState == TaskState::Running) {
+                    SetTaskState(TaskId::GripOpen, TaskState::Done);
+                }
+
+                TaskState closeState = g_taskStatus[(int)TaskId::GripClose].state.load();
+                if (closeState == TaskState::Running) {
+                    SetTaskState(TaskId::GripClose, TaskState::Done);
+                }
+            }
 
             // 이전 Motioning 상태 업데이트
             s_prevMotioning = curMotioning;
@@ -1582,6 +1596,7 @@ static bool CheckDemoUnloadPreconditions()
     return true;
 }
 
+void DoGripServoOff_Compat(HWND hWnd);
 
 
 // =======================================
@@ -1593,8 +1608,8 @@ void DoOpen_Compat(HWND hWnd)
     SetTaskState(TaskId::GripOpen, TaskState::Running);
 
     
-    // 1) STO 펄스 (10번: ON → 타이머로 자동 OFF)
-    ToggleDO_HW(10, true, hWnd);
+ //   // 1) STO 펄스 (10번: ON → 타이머로 자동 OFF)
+	//DoGripServoOff_Compat(hWnd);
 
     // 2) Close OFF
     ToggleDO_HW(9, false, hWnd);
@@ -1604,7 +1619,7 @@ void DoOpen_Compat(HWND hWnd)
     ToggleDO_HW(8, false, hWnd);
     ToggleDO_HW(8, true, hWnd);   // 이 상태가 계속 유지 → Open 상태
 
-    ToggleDO_HW(10, true, hWnd);
+	//DoGripServoOff_Compat(hWnd);
 }
 
 void DoClose_Compat(HWND hWnd)
@@ -1613,7 +1628,7 @@ void DoClose_Compat(HWND hWnd)
     SetTaskState(TaskId::GripClose, TaskState::Running);
 
     // 1) STO 펄스
-    ToggleDO_HW(10, true, hWnd);
+	//DoGripServoOff_Compat(hWnd);
 
     // 2) Open OFF
     ToggleDO_HW(8, false, hWnd);
@@ -1622,12 +1637,13 @@ void DoClose_Compat(HWND hWnd)
     // 3) Close 신호: 9번을 한번 OFF 했다가 ON (에지 만들기)
     ToggleDO_HW(9, false, hWnd);
     ToggleDO_HW(9, true, hWnd);   // 이 상태 유지 → Close 상태
-    ToggleDO_HW(10, true, hWnd);
+	//DoGripServoOff_Compat(hWnd);
     
 }
 
 void DoGripServoOff_Compat(HWND hWnd) {
     ToggleDO_HW(10, true, hWnd); // STO ON (펄스)
+    ToggleDO_HW(10, false, hWnd); // STO ON (펄스)
     SetTaskState(TaskId::GripServoOff, TaskState::Done);
 }
 
@@ -2367,7 +2383,7 @@ static LRESULT CALLBACK DemoWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         SetTimer(hWnd, IDT_GPIO_REFRESH, kPollIntervalMs, nullptr);
 
         // 창이 열릴 때 STO 펄스 1회 (오류 클리어)
-        ToggleDO_HW(10, true, hWnd);
+		DoGripServoOff_Compat(hWnd);
 
         return 0;
     }
@@ -2403,7 +2419,7 @@ static LRESULT CALLBACK DemoWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
             // Open/Close는 STO 먼저
             if (on && (pin == 8 || pin == 9)) {
-                ToggleDO_HW(10, true, g_hDemoWnd);
+				DoGripServoOff_Compat(g_hDemoWnd);
             }
             ToggleDO_HW(pin, on, g_hDemoWnd);
 
