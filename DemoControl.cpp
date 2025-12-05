@@ -2485,15 +2485,26 @@ static LRESULT CALLBACK DemoWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         // Motioning(DI0) ↔ DO11 1:1 동기화
         // =====================================
             {
-                static bool s_prevDo11 = false;
+                // DemoLoad / DemoUnload 상태 확인
+                TaskState loadState = GetTaskState(TaskId::DemoLoad);
+                TaskState unloadState = GetTaskState(TaskId::DemoUnload);
 
-                // 디바운스된 Motioning 입력 (DI0)
-                bool motioning = g_diStable[0];
+                bool demoBusy =
+                    (loadState == TaskState::Running) ||
+                    (unloadState == TaskState::Running);
 
-                // 상태가 바뀔 때만 DO11을 갱신해서 쓸데없는 출력 반복 방지
-                if (motioning != s_prevDo11) {
-                    ToggleDO_HW(11, motioning, g_hDemoWnd);
-                    s_prevDo11 = motioning;
+                // ★ 데모 시퀀스가 "안 돌 때만" DI0→DO11 동기화 수행
+                if (!demoBusy) {
+                    static bool s_prevDo11 = false;
+
+                    // 디바운스된 Motioning 입력 (DI0)
+                    bool motioning = g_diStable[0];
+
+                    // 상태가 바뀔 때만 DO11을 갱신해서 쓸데없는 출력 반복 방지
+                    if (motioning != s_prevDo11) {
+                        ToggleDO_HW(11, motioning, g_hDemoWnd);
+                        s_prevDo11 = motioning;
+                    }
                 }
             }
             return 0;
