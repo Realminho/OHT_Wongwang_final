@@ -130,10 +130,10 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="..\MapView.cpp" />
-    <ClCompile Include="..\oht_main.cpp" />
     <ClCompile Include="DemoControl.cpp" />
     <ClCompile Include="GPIO_Control.cpp" />
+    <ClCompile Include="MapView.cpp" />
+    <ClCompile Include="oht_main.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\MapView.h" />

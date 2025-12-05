@@ -43,6 +43,7 @@
 #include "IOApi.h"
 #include "EcApi.h" // EtherCAT API
 #include "LogApi.h"
+#include "DemoShared.h"
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "Shlwapi.lib")
@@ -61,8 +62,46 @@ using namespace wmx3Api;
 using namespace ecApi;
 
 // ===== External launchers declared by user-provided modules =====
-void ShowDemoControlWindow(HWND hParent);
+void ShowDemoControlWindow(HWND hParent, bool minimized = false);
 extern "C" int RunGPIOWindowExternal(HINSTANCE hInst);
+
+// ==== DemoControl에서 제공하는 GPIO/그리퍼/상태 함수 extern ====
+// CHANGED: 아래 extern들은 democontrol 모듈의 함수를 창 없이도 호출하기 위해 필요
+extern void ToggleDO_HW(int pin, bool turnOn, HWND hWnd);
+extern bool EnumerateGPIO();
+extern bool PickBank_DI0_7_DO8_15();
+extern bool EnsureDO8to15AsOutput_BankFirst();
+extern void RefreshLevels(HWND hWnd);
+static int g_gpioBank = -1;
+
+extern bool IsGripperOpen();
+extern bool IsGripperOpenAndIdle();
+extern bool IsGripperClosed();
+extern bool IsGripperClosedAndIdle();
+extern bool g_diStable[8]; // DI0(Motioning), DI1(Catched) 등 디바운스 결과 사용
+
+// ============ 상태 조회 헬퍼(예시) ============
+static bool IsGripperAlreadyOpen()
+{
+	// IsGripperOpenAndIdle가 충분하면 그것으로 대체 가능
+	return IsGripperOpenAndIdle();
+}
+
+static bool IsGripperAlreadyClosed()
+{
+	return IsGripperClosedAndIdle();
+}
+
+extern struct ApproachProfile {
+	double vpps = 1000.0;
+	double accMs = 80.0;
+	double decMs = 10.0;
+};
+
+extern void StartMoveWithApproach(int axis, long long target, TaskId task,
+	double mainVpps, double mainAccMs, double mainDecMs,
+	double posEps, double velEps, DWORD timeoutMs,
+	double approachEps, const ApproachProfile& ap);
 
 // ===================== 사용자 설정 =====================
 static TCHAR g_installPath[] = TEXT("C:\\Program Files\\SoftServo\\WMX3");
@@ -97,6 +136,7 @@ const DWORD LOG_POLL_MS = 50;
 // 축별 명령 수신/완료 카운터
 std::atomic<unsigned long> g_cmdDoneCount[4] = { 0,0,0,0 };
 
+
 // 명령 추적
 struct AxisCommandInfo {
 	std::atomic<long long> target{ 0 };
@@ -126,6 +166,137 @@ Log g_log(&g_wmx);
 
 // 재사용 상태 버퍼
 static CoreMotionStatus g_status{};
+
+static void StopMultiJog();
+static void StopJogIfActive();
+
+extern void GO_Conveyor();     // Conveyor 버튼이 눌렸을 때 실행되는 함수
+extern void Go_Workstation();  // Workstation 버튼이 눌렸을 때 실행되는 함수
+extern void ConveyorDown();    // Conveyor Down 버튼
+extern void WorkDown();        // Work Down 버튼
+extern void DoUp();            // Up 버튼
+
+extern void DoClose_Compat(HWND hWnd); // Close 버튼
+extern void DoOpen_Compat(HWND hWnd); // Open 버튼
+extern void DoStopAll(HWND hWnd); // Stop All 버튼
+
+// ===== CHANGED: 그립 동작 중인지 여부 플래그 =====
+// democontrol 창 없이 TCP로 Open/Close를 수행할 때, 움직이는 동안은 0x00 상태를 내기 위함
+static std::atomic<bool> g_gripBusy{ false };
+
+// ===== STO 펄스 자동 OFF를 위한 예약 =====
+// oht main에서도 AutoInitIoAndRefresh 시점에 ToggleDO_HW(10,true) 후 자동 OFF를 처리
+static std::atomic<bool> g_ohtStoPulsePendingOff{ false };
+static std::atomic<DWORD> g_ohtStoPulseOnTick{ 0 };
+static const DWORD kOhtStoPulseMs = 100;
+
+// ------------------ Serial Monitor Window ------------------
+static HWND g_hSerialWnd = nullptr;
+
+// WndProc 먼저 선언
+LRESULT CALLBACK SerialWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+
+// ===================== NEW: Manual/Auto Mode =====================
+static std::atomic<bool> g_autoMode{ false }; // false=Manual, true=Auto
+
+// Helper to check/guard manual-only commands
+static bool IsManualAllowed(HWND hWnd) {
+	if (g_autoMode.load()) {
+		MessageBox(hWnd, TEXT("현재 자동 모드입니다. 수동 동작은 무시됩니다."), TEXT("모드"), MB_ICONWARNING);
+		return false;
+	}
+	return true;
+}
+// Helper to check/guard auto-only commands (TCP etc.)
+static bool IsAutoAllowed() {
+	return g_autoMode.load();
+}
+
+// Ensure Serial Monitor window exists and is a top-level independent window
+static void EnsureSerialWindowTopLevel(HWND hMain)
+{
+	if (g_hSerialWnd && IsWindow(g_hSerialWnd))
+		return;
+
+	WNDCLASS wc{};
+	wc.style = CS_HREDRAW | CS_VREDRAW;
+	wc.lpfnWndProc = SerialWndProc; // 람다 대신 일반 함수 포인터
+	wc.cbClsExtra = 0;
+	wc.cbWndExtra = 0;
+	wc.hInstance = (HINSTANCE)GetWindowLongPtr(hMain, GWLP_HINSTANCE);
+	wc.hIcon = nullptr;
+	wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+	wc.hbrBackground = (HBRUSH)(COLOR_3DFACE + 1);
+	wc.lpszMenuName = nullptr;
+	wc.lpszClassName = TEXT("WMX3SerialWnd");
+
+	RegisterClass(&wc);
+
+	// Create as top-level independent window (no parent), ensure it shows on taskbar
+	g_hSerialWnd = CreateWindowEx(
+		WS_EX_APPWINDOW,
+		TEXT("WMX3SerialWnd"),
+		TEXT("Serial Monitor (TCP)"),
+		WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_SIZEBOX,
+		CW_USEDEFAULT, CW_USEDEFAULT, 800, 400,
+		nullptr,           // NO parent
+		nullptr,           // menu
+		wc.hInstance,
+		nullptr);
+
+	if (g_hSerialWnd) {
+		ShowWindow(g_hSerialWnd, SW_SHOWNORMAL);
+		UpdateWindow(g_hSerialWnd);
+		BringWindowToTop(g_hSerialWnd);
+		SetForegroundWindow(g_hSerialWnd);
+		SetWindowPos(g_hSerialWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+		SetWindowPos(g_hSerialWnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+	}
+}
+
+static void ApplyModeUI(HWND hMain) {
+	// 수동 모드: 메인 GUI 전면, SerialMonitor 숨기거나 최소화
+	// 자동 모드: 메인 GUI 최소화, SerialMonitor(있으면) 전면
+	if (!hMain) return;
+	if (g_autoMode.load()) {
+		ShowWindow(hMain, SW_MINIMIZE);
+		EnsureSerialWindowTopLevel(hMain);
+		if (IsWindow(g_hSerialWnd)) {
+			ShowWindow(g_hSerialWnd, SW_SHOWNORMAL);
+			BringWindowToTop(g_hSerialWnd);
+			SetForegroundWindow(g_hSerialWnd);
+		}
+	}
+	else {
+		ShowWindow(hMain, SW_SHOWNORMAL);
+		SetForegroundWindow(hMain);
+		if (IsWindow(g_hSerialWnd)) {
+			// 자동 모드 해제 시 Serial을 굳이 닫지 않고 그대로 유지. 필요하면 최소화.
+			ShowWindow(g_hSerialWnd, SW_MINIMIZE);
+		}
+	}
+}
+static void SwitchToManual(HWND hMain) {
+	// Stop any jog
+	StopMultiJog();
+	StopJogIfActive();
+	// Optionally stop all motion?
+	for (int a = 0; a < 4; ++a) StopAxis(a); // 선택사항
+
+	g_autoMode = false;
+	ApplyModeUI(hMain);
+}
+static void SwitchToAuto(HWND hMain) {
+	// Stop jog
+	StopMultiJog();
+	StopJogIfActive();
+	// Optionally stop all motion?
+	for (int a = 0; a < 4; ++a) StopAxis(a); // 선택사항
+
+	g_autoMode = true;
+	ApplyModeUI(hMain);
+}
 
 static void ShowErrMsgBox(const TCHAR* title, long err, WMX3Api& api) {
 	char bufA[256] = {};
@@ -375,6 +546,7 @@ static int g_tcpBindPort = 9100;
 
 #define WM_APP_TCP_LOG (WM_APP + 101)
 #define WM_APP_TCP_STATE (WM_APP + 102)
+#define WM_APP_SHOW_DEMO_MIN (WM_APP + 103)   // ★ 추가
 #define WM_APP_MAP_GOTO (WM_APP + 201)
 
 struct MapGotoParam { long long target; };
@@ -900,7 +1072,6 @@ static void ShowErrorManual(HWND hParent, bool fastech)
 	ShowWindow(w, SW_SHOWNORMAL);
 }
 
-
 // Forward decl
 static bool IsAxisChecked(HWND hWnd, int axis);
 static void SetAxisChecked(HWND hWnd, int axis, bool checked);
@@ -1009,29 +1180,29 @@ static bool ReadAxis_TxPDO_603F(int slaveId, int& outVal) {
 	return false;
 }
 
-bool ReadAxis_TxPDO_2181_ActualCurrent(int slaveId, int& outVal) {
-	if (!g_deviceOpened || !g_commStarted) return false;
-	unsigned char buf[8] = {};
-	unsigned int actual = 0;
-	long e = g_ecat.PdoRead(slaveId, kIdxActualCurrent, kSubIdxActualCurrent, (unsigned int)sizeof(buf), buf, &actual);
-	if (e != ErrorCode::None) return false;
-	if (actual < 4) return false;
-	int32_t v = (int32_t)((uint32_t)buf[0] | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24));
-	outVal = (int)v;
-	return true;
-}
-
-bool ReadAxis_TxPDO_6077_TorqueActual(int slaveId, int& outVal) {
-	if (!g_deviceOpened || !g_commStarted) return false;
-	unsigned char buf[8] = {};
-	unsigned int actual = 0;
-	long e = g_ecat.PdoRead(slaveId, kIdxTorqueActual, kSubIdxTorqueActual, (unsigned int)sizeof(buf), buf, &actual);
-	if (e != ErrorCode::None) return false;
-	if (actual < 2) return false;
-	int16_t s16 = (int16_t)((uint16_t)buf[0] | ((uint16_t)buf[1] << 8));
-	outVal = (int)s16;
-	return true;
-}
+//bool ReadAxis_TxPDO_2181_ActualCurrent(int slaveId, int& outVal) {
+//	if (!g_deviceOpened || !g_commStarted) return false;
+//	unsigned char buf[8] = {};
+//	unsigned int actual = 0;
+//	long e = g_ecat.PdoRead(slaveId, kIdxActualCurrent, kSubIdxActualCurrent, (unsigned int)sizeof(buf), buf, &actual);
+//	if (e != ErrorCode::None) return false;
+//	if (actual < 4) return false;
+//	int32_t v = (int32_t)((uint32_t)buf[0] | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24));
+//	outVal = (int)v;
+//	return true;
+//}
+//
+//bool ReadAxis_TxPDO_6077_TorqueActual(int slaveId, int& outVal) {
+//	if (!g_deviceOpened || !g_commStarted) return false;
+//	unsigned char buf[8] = {};
+//	unsigned int actual = 0;
+//	long e = g_ecat.PdoRead(slaveId, kIdxTorqueActual, kSubIdxTorqueActual, (unsigned int)sizeof(buf), buf, &actual);
+//	if (e != ErrorCode::None) return false;
+//	if (actual < 2) return false;
+//	int16_t s16 = (int16_t)((uint16_t)buf[0] | ((uint16_t)buf[1] << 8));
+//	outVal = (int)s16;
+//	return true;
+//}
 
 static bool ReadAxis0_TxPDO_6063(int& outVal) {
 	return ReadAxis_TxPDO_6063(kAxisSlaveId[0], outVal);
@@ -1067,7 +1238,74 @@ static bool DebounceReadSensor(Io& io, bool& stableOn, DWORD& lastChangeTick) {
 	return false;
 }
 
+// ======================== 인터락 보조 함수들 ========================
+
+// 현재 위치(주행) 코드: Load=0x01, Unload=0x02, 그 외=0x00
+static inline unsigned char CalcPosTravelCode()
+{
+	int bc = 0;
+	if (!ReadAxis0_TxPDO_6063(bc)) return 0x00;
+	if (std::llabs((long long)bc - 476774) <= 10) return 0x01; // Load
+	if (std::llabs((long long)bc - 491332) <= 10) return 0x02; // Unload
+	return 0x00;
+}
+
+// Axis2 리밋 센서 현재 상태
+static inline bool IsAxis2LimitOn()
+{
+	return g_ax2LimitOn.load();
+}
+
+// Auto 모드일 때만 적용되는 인터락: Axis0(주행) 시작 가능 여부
+static bool CanAxis0Move_Auto()
+{
+	// 요구: Axis2 리밋 센서 ON일 때만 Axis0 동작 가능
+	return IsAxis2LimitOn();
+}
+
+// Auto 모드일 때만 적용되는 인터락: Axis2(상하) 시작 가능 여부
+static bool CanAxis2Move_Auto()
+{
+	// 요구: 주행 위치가 Load/Unload 위치일 때만 Axis2 동작 가능
+	unsigned char code = CalcPosTravelCode();
+	return (code == 0x01 || code == 0x02);
+}
+
+// Auto 모드에서 Axis0/Axis2 인터락 메시지
+static void ShowAxis0InterlockMsg()
+{
+	MessageBox(g_hMainWnd ? g_hMainWnd : nullptr,
+		TEXT("인터락: Axis2 리밋 센서가 ON일 때만 주행축(Axis0) 동작 가능합니다."),
+		TEXT("Interlock (Axis0)"), MB_ICONWARNING);
+}
+static void ShowAxis2InterlockMsg()
+{
+	MessageBox(g_hMainWnd ? g_hMainWnd : nullptr,
+		TEXT("인터락: 주행부가 Load/Unload 위치에 있을 때만 상하축(Axis2) 동작 가능합니다."),
+		TEXT("Interlock (Axis2)"), MB_ICONWARNING);
+}
+
+// Auto 모드에서 Axis0/Axis2의 이동/조그/상대/절대 명령에 대해 공통 검사
+static bool CheckInterlockBeforeAxisCommand(int axis)
+{
+	if (!g_autoMode.load()) return true; // 인터락은 Auto 모드에서만
+
+	if (axis == 0) {
+		if (!CanAxis0Move_Auto()) { ShowAxis0InterlockMsg(); return false; }
+	}
+	if (axis == 2) {
+		if (!CanAxis2Move_Auto()) { ShowAxis2InterlockMsg(); return false; }
+	}
+	return true;
+}
+
+// ===================================================================
+
 static bool StartRelMoveWithProfile(int axis, long long delta, double vpps, double tAcc, double tDec) {
+
+	// Axis0/Axis2 인터락
+	if (!CheckInterlockBeforeAxisCommand(axis)) return false;
+
 	g_cm.GetStatus(&g_status);
 	long long cur = (long long)g_status.axesStatus[axis].actualPos;
 	long long tgt = cur + delta;
@@ -1150,6 +1388,11 @@ inline int ID_BTN_APPLY_ALT_A(int axis) { return 3100 + axis; }
 
 #define ID_BTN_ESTOP_TOGGLE 7250
 #define ID_TXT_ESTOP_STATE 7251
+
+// NEW: Manual/Auto mode buttons and label
+#define ID_BTN_MODE_MANUAL 7260
+#define ID_BTN_MODE_AUTO   7261
+#define ID_TXT_MODE_STATE  7262
 
 inline int ID_TXT_STATUS(int axis, int col) { return 8000 + axis * 30 + col; }
 #define ID_TXT_SELECTED_AXES 9000
@@ -1288,7 +1531,12 @@ struct JogBtnCtx { int axis; int sign; bool isMulti; };
 
 static bool StartJog(HWND hWnd, int axis, int sign) {
 	if (!g_commStarted) { MessageBox(hWnd, TEXT("Start Communication first."), TEXT("Info"), MB_ICONWARNING); return false; }
-	
+
+	//// Auto 모드 인터락: Axis0/2 조그 시작 전 검사
+	//if (g_autoMode.load()) {
+	//	if (!CheckInterlockBeforeAxisCommand(axis)) return false;
+	//}
+
 	if (axis == 2) {
 		// Axis2는 Limit ON 시 -방향 차단
 		g_cm.GetStatus(&g_status);
@@ -1298,7 +1546,7 @@ static bool StartJog(HWND hWnd, int axis, int sign) {
 			return false;
 		}
 	}
-	
+
 	//DisableAllEnabledSyncGroups();
 	if (!EnsureServoOn(axis)) return false;
 	if (!EnsurePosModeNoStop(axis)) return false;
@@ -1356,6 +1604,12 @@ static bool StartMultiJog(HWND hWnd, int sign) {
 	g_cm.GetStatus(&g_status);
 	for (int a = 0; a < 4; ++a) {
 		if (!IsAxisChecked(hWnd, a)) continue;
+
+		// Auto 모드 인터락: Axis0/2에만 적용
+		if (g_autoMode.load()) {
+			if (!CheckInterlockBeforeAxisCommand(a)) continue;
+		}
+
 		// Axis2 보호: 리밋 ON시 -방향 JOG 차단
 		if (a == 2) {
 			long long cur = (long long)g_status.axesStatus[2].actualPos;
@@ -1445,6 +1699,9 @@ static void DoToggleEStop(HWND hWnd, bool syncWindow)
 
 bool StartAbsMoveWithProfile(int axis, long long target, double vpps, double tAcc, double tDec) {
 
+	// Auto 모드 인터락: Axis0/2 이동 전 검사
+	if (!CheckInterlockBeforeAxisCommand(axis)) return false;
+
 	// Axis2 보호 체크: 리밋 ON시 -방향 금지
 	if (axis == 2 && g_commStarted) {
 		g_cm.GetStatus(&g_status);
@@ -1486,10 +1743,46 @@ static bool StartRelMoveWithProfile_Generic(int axis, long long delta, double vp
 }
 
 // ------------------ WMX3 init/shutdown ------------------
+// ====== Init guards & retry helpers ======
+static std::atomic<bool> g_initTried{ false };
+static std::atomic<bool> g_commTried{ false };
+static std::atomic<bool> g_autoStartDone{ false };
+static std::atomic<bool> g_ioInitDone{ false };
+
+static long CreateDeviceWithRetry(WMX3Api& api, const TCHAR* installPath, int maxRetry = 2, DWORD backoffMs = 300)
+{
+	long err = ErrorCode::None;
+	for (int i = 0; i <= maxRetry; ++i) {
+		err = api.CreateDevice(installPath, DeviceType::DeviceTypeNormal);
+		if (err == ErrorCode::None) return err;
+		// 에러 268 등 제어 채널 락 실패 시에는 CloseDevice 하고 백오프 후 재시도
+		api.CloseDevice();
+		Sleep(backoffMs * (i + 1));
+	}
+	return err;
+}
 static bool InitDevice() {
-	long e = g_wmx.CreateDevice(g_installPath, DeviceType::DeviceTypeNormal);
-	if (e != ErrorCode::None) { ShowErrMsgBox(TEXT("CreateDevice 실패"), e, g_wmx); return false; }
-	g_deviceOpened = true; return true;
+	// 이미 열려 있으면 OK
+	if (g_deviceOpened) return true;
+
+	// 중복 시도 방지
+	bool expected = false;
+	if (!g_initTried.compare_exchange_strong(expected, true)) {
+		// 다른 경로에서 이미 시도 중이거나 완료됨
+		// 현재 상태를 그대로 보고
+		return g_deviceOpened;
+	}
+
+	// 재시도 포함하여 CreateDevice
+	long e = CreateDeviceWithRetry(g_wmx, g_installPath, /*maxRetry*/2, /*backoffMs*/300);
+	if (e != ErrorCode::None) {
+		ShowErrMsgBox(TEXT("CreateDevice 실패"), e, g_wmx);
+		g_initTried = false; // 다음에 다시 눌러볼 수 있게
+		return false;
+	}
+
+	g_deviceOpened = true;
+	return true;
 }
 
 // Helper: Set gear ratio for one axis (numerator/denominator)
@@ -1504,21 +1797,35 @@ static bool SetAxisGearRatio(int axis, double numerator, double denominator) {
 }
 
 static bool StartComm() {
+	if (!g_deviceOpened) {
+		// 장치가 없으면 먼저 InitDevice
+		if (!InitDevice()) return false;
+	}
+
+	if (g_commStarted) return true;
+
+	bool expected = false;
+	if (!g_commTried.compare_exchange_strong(expected, true)) {
+		// 다른 경로에서 이미 시도 중이거나 완료됨
+		return g_commStarted;
+	}
+
 	long e = g_wmx.StartCommunication(15000);
-	if (e != ErrorCode::None) { ShowErrMsgBox(TEXT("StartCommunication 실패"), e, g_wmx); return false; }
+	if (e != ErrorCode::None) {
+		ShowErrMsgBox(TEXT("StartCommunication 실패"), e, g_wmx);
+		g_commTried = false; // 다음 시도 허용
+		return false;
+	}
+
 	g_commStarted = true;
 	g_estopActive = false;
 
-	// ========== NEW: 기어비 설정 ==========
-	// 축 0,1: 43000 / 10000
-	// 축 2:   100000 / 10000
-	// 축 3: 스킵(필요하면 추가)
+	// 기어비 설정 등 초기 파라미터
 	SetAxisGearRatio(0, 43000.0, 10000.0);
 	SetAxisGearRatio(1, 43000.0, 10000.0);
 	SetAxisGearRatio(2, 100000.0, 10000.0);
-	//SetAxisGearRatio(3, 43000.0, 10000.0); // 필요 시 사용
 
-	// Axis2 Limit/Home 상태 초기화
+	// Axis2 sensor flags reset
 	g_ax2LimitOn = false;
 	g_ax2HomeOn = false;
 	g_ax2LimitLatched = false;
@@ -1533,15 +1840,256 @@ static bool StartComm() {
 }
 
 static void ShutdownWMX() {
-	StopJogIfActive(); StopMultiJog();
-	if (!g_deviceOpened) return;
-	for (int a = 0; a < 4; ++a) g_cm.axisControl->SetServoOn(a, 0);
-	if (g_commStarted) { g_wmx.StopCommunication(); g_commStarted = false; }
-	g_wmx.CloseDevice(); g_deviceOpened = false;
+	StopJogIfActive();
+	StopMultiJog();
+
+	if (g_commStarted) {
+		g_wmx.StopCommunication();
+		g_commStarted = false;
+		g_commTried = false;
+	}
+
+	if (g_deviceOpened) {
+		g_wmx.CloseDevice();
+		g_deviceOpened = false;
+		g_initTried = false;
+	}
+
 	g_estopActive = false;
 }
 
-// ------------------ TCP Server ------------------
+// ------------------ 주기 상태 전송(1초) 쓰레드 [NEW] ------------------
+std::atomic<bool> g_periodicRun{ false };
+std::thread g_periodicThread;
+std::atomic<unsigned char> g_heartbeat{ 0 };
+
+extern bool IsGripperOpen(); // 그립퍼 열림 상태 외부 참조
+extern bool IsGripperOpenAndIdle(); // 그립퍼 열림 상태 외부 참조
+extern bool IsGripperClosed(); // 그립퍼 닫힘 상태 외부 참조
+extern bool IsGripperClosedAndIdle(); // 그립퍼 닫힘 상태 외부 참조
+extern bool g_distable[8]; // 그립퍼 축 비활성화 플래그 외부 참조
+extern bool WaitAllAxesStopped(double velEps, DWORD timeoutMs); // 외부 참조
+
+
+static inline bool BetweenTol(long long v, long long center, long long tol) {
+	return (std::llabs(v - center) <= tol);
+}
+
+// 현재위치(주행) 계산: Axis0의 6063 기준
+// Load=01 (278000±10), Unload=02 (253381±10), 그 외 00
+static unsigned char CalcPosTravelCode(); // 위에서 정의됨
+//static unsigned char CalcPosTravelCode()
+//{
+//	int bc = 0;
+//	if (!ReadAxis0_TxPDO_6063(bc)) return 0x00;
+//	if (BetweenTol(bc, 278000, 10)) return 0x01; // Load
+//	if (BetweenTol(bc, 253381, 10)) return 0x02; // Unload
+//	return 0x00;
+//}
+
+// 현재위치(상하) 계산: Axis2 actualPos
+// Load=01 (60000±10), Unload=02 (57000±10), Up=03 (0±10), 그 외 00
+static unsigned char CalcPosHoistCode()
+{
+	if (!g_commStarted) return 0x00;
+	g_cm.GetStatus(&g_status);
+	long long p = (long long)g_status.axesStatus[2].actualPos;
+	if (BetweenTol(p, 51600, 10)) return 0x01;
+	if (BetweenTol(p, 45000, 10)) return 0x02;
+	if (BetweenTol(p, 0, 10))     return 0x03;
+	return 0x00;
+}
+
+static unsigned char CalcPosGripCode()
+{
+	// 진행중이면 0x00
+	if (g_gripBusy.load()) return 0x00;
+
+	// Motioning 입력(DI0)을 참조: ON이면 동작중이므로 0x00
+	// g_diStable[0] == true 면 Motioning ON으로 사용하고 있으므로, true => 동작중
+	if (g_diStable[0]) return 0x00;
+
+	// DemoControl 쪽 Gripper 판단 로직 재사용
+	bool isOpen = IsGripperOpenAndIdle();
+	bool isClose = IsGripperClosedAndIdle();
+	bool openinit = IsGripperOpen();
+	bool closeinit = IsGripperClosed();
+
+	// Open만 ON
+	if (isOpen && !isClose || openinit)
+		return 0x01;
+
+	// Close만 ON
+	if (!isOpen && isClose || closeinit)
+		return 0x02;
+
+	// 둘 다 OFF이거나, 둘 다 ON이거나, 판단 불가 → 0x00
+	return 0x00;
+}
+
+
+// 알람코드(주행축): axis0/1 중 0이 아닌 603F 반환(우선 axis0)
+static unsigned short GetTravelAlarm603F()
+{
+	int e0 = 0, e1 = 0;
+	bool ok0 = ReadAxis_TxPDO_603F(kAxisSlaveId[0], e0);
+	bool ok1 = ReadAxis_TxPDO_603F(kAxisSlaveId[1], e1);
+	unsigned short v0 = ok0 ? (unsigned short)(e0 & 0xFFFF) : 0;
+	unsigned short v1 = ok1 ? (unsigned short)(e1 & 0xFFFF) : 0;
+	return v0 ? v0 : v1;
+}
+
+// 알람코드(상하축): axis2의 603F
+static unsigned short GetHoistAlarm603F()
+{
+	int e2 = 0;
+	bool ok2 = ReadAxis_TxPDO_603F(kAxisSlaveId[2], e2);
+	return ok2 ? (unsigned short)(e2 & 0xFFFF) : 0;
+}
+
+static std::atomic<unsigned short> g_ohtMsgId{ 1 };
+
+// 0x0001 ~ 0xFFFF 사용, 0x0000은 건너뜀
+static unsigned short NextOhtMsgId()
+{
+	unsigned short cur = g_ohtMsgId.load(std::memory_order_relaxed);
+	while (true) {
+		unsigned short next = (cur == 0xFFFF) ? 1 : (unsigned short)(cur + 1);
+		if (g_ohtMsgId.compare_exchange_weak(
+			cur, next,
+			std::memory_order_release,
+			std::memory_order_relaxed))
+		{
+			return cur; // cur 값을 실제로 쓸 MsgID로 사용
+		}
+		// 실패하면 cur가 새 값으로 갱신되니 다시 루프 돌면서 재시도
+	}
+}
+
+static void SendPeriodicStateFrame(SOCKET s)
+{
+	if (s == INVALID_SOCKET) return;
+
+	unsigned short msgId = NextOhtMsgId();
+
+	unsigned char mode = g_autoMode.load() ? 0x01 : 0x00;
+	unsigned char posTravel = CalcPosTravelCode();
+	unsigned char posHoist = CalcPosHoistCode();
+	unsigned char posGrip = CalcPosGripCode(); // 보류
+	unsigned short almTravel = GetTravelAlarm603F();
+	unsigned short almHoist = GetHoistAlarm603F();
+	unsigned char almGripL = 0x00, almGripH = 0x00; // 보류
+	unsigned char hb = g_heartbeat.load();
+
+	// [수정] 실제 페이로드 바이트 수 계산 (11바이트)
+	// mode(1) + posTravel(1) + posHoist(1) + posGrip(1)
+	// + almTravel(2) + almHoist(2) + almGrip(2) + hb(1)
+	const unsigned char payload_len = 0x0B; // [수정] 0x09 -> 0x0B (11)
+
+	// [수정] 프레임 총 길이: STX(1) + MsgID(2) + Op(1) + Len(1) + Payload(payload_len) + ETX(1)
+	const size_t frame_capacity = 5 + payload_len + 1;
+
+	// [수정] 고정 크기 대신 계산된 크기로 배열 확보
+	unsigned char frame[5 + 0x0B + 1] = {}; // = 5 + 11 + 1 = 17 바이트
+
+	// Header
+	frame[0] = 0x02;       // STX
+	frame[1] = 0x00; // MsgID High
+	frame[2] = 0x00;        // MsgID Low
+	frame[3] = 0xFE;       // Operation Code: State
+	frame[4] = payload_len; // [수정] 0x09 -> payload_len
+
+	// Payload
+	size_t i = 5;
+	frame[i++] = mode;
+	frame[i++] = posTravel;
+	frame[i++] = posHoist;
+	frame[i++] = posGrip;
+	// 알람코드(주행) 2 bytes (LSB, MSB)
+	frame[i++] = (unsigned char)(almTravel & 0xFF);
+	frame[i++] = (unsigned char)((almTravel >> 8) & 0xFF);
+	// 알람코드(상하) 2 bytes
+	frame[i++] = (unsigned char)(almHoist & 0xFF);
+	frame[i++] = (unsigned char)((almHoist >> 8) & 0xFF);
+	// 알람코드(그립) 2 bytes
+	frame[i++] = almGripL;
+	frame[i++] = almGripH;
+	// Heartbeat (토글 대상 값)
+	frame[i++] = hb;
+
+	// ETX
+	frame[i++] = 0x03;
+
+	// [추가] 방어적 검사: i는 frame_capacity와 같아야 함
+	// (개발 중 디버그 보조용, 릴리스에서는 제거 가능)
+	// assert(i == frame_capacity);
+
+	send(s, (const char*)frame, (int)i, 0);
+
+	// 토글
+	g_heartbeat = (unsigned char)(hb ? 0x00 : 0x01);
+}
+
+// msgId는 이제 필요 없음, OHT 자체 시퀀스로 보냄
+static void SendSimpleAck(SOCKET s, unsigned char reqOpCode)
+{
+	if (s == INVALID_SOCKET) return;
+
+	unsigned char f[7];
+	unsigned short msgId = NextOhtMsgId();
+
+	f[0] = 0x02;                                 // STX
+	f[1] = 0x00; // MsgID High
+	f[2] = 0x00;        // MsgID Low
+	f[3] = 0xFF;                                 // ACK OpCode
+	f[4] = 0x01;                                 // Payload Length = 1
+	f[5] = reqOpCode;                            // Payload: 원 요청 OpCode
+	f[6] = 0x03;                                 // ETX
+
+	send(s, (const char*)f, 7, 0);
+}
+
+
+static void SendSimpleDone(SOCKET s, unsigned char reqOpCode)
+{
+	if (s == INVALID_SOCKET) return;
+
+	unsigned char f[7];
+	unsigned short msgId = NextOhtMsgId();
+
+	f[0] = 0x02;                                 // STX
+	f[1] = 0x00; // MsgID High
+	f[2] = 0x00;        // MsgID Low
+	f[3] = 0x81;                                 // DONE OpCode
+	f[4] = 0x01;                                 // Payload Length = 1
+	f[5] = reqOpCode;                            // Payload: 원 요청 OpCode
+	f[6] = 0x03;                                 // ETX
+
+	send(s, (const char*)f, 7, 0);
+}
+
+
+
+// ---- NEW: Human-readable op name ----
+static const wchar_t* DecodeOpName(unsigned char op)
+{
+	switch (op) {
+	case 0x21: return L"Load Request";
+	case 0x22: return L"Unload Request";
+	case 0x29: return L"Stop Motion Request";
+	case 0x2A: return L"Travel Position Command";
+	case 0x2B: return L"Hoist Position Command";
+	case 0x2C: return L"Grip Position Command";
+	case 0xFD: return L"Reset Request";
+	case 0xFE: return L"State Frame";
+	case 0xFF: return L"ACK";
+	case 0x81: return L"Done";
+	case 0xF0: return L"Comm Open";
+	default:   return L"Unknown";
+	}
+}
+
+// ---- NEW: Append human readable log to Serial Monitor ----
 static void AppendLog(const wchar_t* wmsg)
 {
 	size_t len = wcslen(wmsg);
@@ -1549,6 +2097,185 @@ static void AppendLog(const wchar_t* wmsg)
 	if (!dup) return;
 	wcscpy_s(dup, len + 1, wmsg);
 	PostMessage(g_hMainWnd ? g_hMainWnd : GetDesktopWindow(), WM_APP_TCP_LOG, 0, (LPARAM)dup);
+}
+
+static void LogFrameHuman(const unsigned char* f, int len, const wchar_t* prefix)
+{
+	if (!f || len <= 0) return;
+
+	// Hex line
+	wchar_t hexbuf[2048];
+	int wi = swprintf_s(hexbuf, L"%s HEX (%d): ", prefix, len);
+	for (int i = 0; i < len && wi < (int)_countof(hexbuf) - 4; ++i)
+		wi += swprintf_s(hexbuf + wi, _countof(hexbuf) - wi, L"%02X ", (unsigned char)f[i]);
+	AppendLog(hexbuf);
+
+	// If basic frame 02 .... 03, decode op and length
+	if (len >= 6 && f[0] == 0x02 && f[len - 1] == 0x03) {
+		unsigned char op = f[3];
+		unsigned char plen = f[4];
+		wchar_t info[256];
+		swprintf_s(info, L"%s Decoded: OP=0x%02X (%s), PayloadLen=%u", prefix, op, DecodeOpName(op), (unsigned)plen);
+		AppendLog(info);
+	}
+}
+
+// 이벤트 처리용 도우미: 예시 동작들
+static void DoOhtAction_Load_Axis0_MoveTo50000()
+{
+	if (!g_commStarted) return;
+	int ax = 0;
+	EnsureServoOn(ax);
+	EnsurePosModeNoStop(ax);
+	// 절대 50000 이동, 프로파일은 간단 값
+	StartAbsMoveWithProfile(ax, 50000, 10000, 100, 100);
+	// 완료 대기
+	DWORD t0 = GetTickCount();
+	while (true) {
+		g_cm.GetStatus(&g_status);
+		long long ap = (long long)g_status.axesStatus[ax].actualPos;
+		int av = (int)std::lround(g_status.axesStatus[ax].actualVelocity);
+		if (std::llabs(ap - 50000) <= 5 && std::abs(av) <= 5) break;
+		if (GetTickCount() - t0 > 30000) break; // timeout 30s
+		Sleep(10);
+	}
+}
+
+// 주행축: axis0, 절대 0 이동 (포지션 번호 2)
+static void DoOhtAction_Load_Axis0_MoveTo0()
+{
+	if (!g_commStarted) return;
+	int ax = 0;
+	if (!EnsureServoOn(ax) || !EnsurePosModeNoStop(ax)) return;
+
+	StartAbsMoveWithProfile(ax, 0, 10000, 100, 100);
+
+	DWORD t0 = GetTickCount();
+	while (true) {
+		g_cm.GetStatus(&g_status);
+		long long ap = (long long)g_status.axesStatus[ax].actualPos;
+		int av = (int)std::lround(g_status.axesStatus[ax].actualVelocity);
+		if (std::llabs(ap - 0) <= 5 && std::abs(av) <= 5) break;
+		if (GetTickCount() - t0 > 30000) break;
+		Sleep(10);
+	}
+}
+
+// 상하축: axis2, Load 높이(60000)
+static void DoOhtAction_Load()
+{
+	if (!g_commStarted) return;
+	int ax = 2;
+	if (!EnsureServoOn(ax) || !EnsurePosModeNoStop(ax)) return;
+
+	StartAbsMoveWithProfile(ax, 51600, 5000, 100, 100);
+
+	DWORD t0 = GetTickCount();
+	while (true) {
+		g_cm.GetStatus(&g_status);
+		long long ap = (long long)g_status.axesStatus[ax].actualPos;
+		int av = (int)std::lround(g_status.axesStatus[ax].actualVelocity);
+		if (std::llabs(ap - 51600) <= 10 && std::abs(av) <= vel_idle_threshold) break;
+		if (GetTickCount() - t0 > 20000) break;
+		Sleep(10);
+	}
+}
+
+// 상하축: axis2, Unload 높이(57000)
+static void DoOhtAction_Unload()
+{
+	if (!g_commStarted) return;
+	int ax = 2;
+	if (!EnsureServoOn(ax) || !EnsurePosModeNoStop(ax)) return;
+
+	StartAbsMoveWithProfile(ax, 57000, 10000, 100, 100);
+
+	DWORD t0 = GetTickCount();
+	while (true) {
+		g_cm.GetStatus(&g_status);
+		long long ap = (long long)g_status.axesStatus[ax].actualPos;
+		int av = (int)std::lround(g_status.axesStatus[ax].actualVelocity);
+		if (std::llabs(ap - 57000) <= 10 && std::abs(av) <= vel_idle_threshold) break;
+		if (GetTickCount() - t0 > 20000) break;
+		Sleep(10);
+	}
+}
+
+// 상하축: axis2, Up 위치(0)
+static void DoOhtAction_Up()
+{
+	if (!g_commStarted) return;
+	int ax = 2;
+	if (!EnsureServoOn(ax) || !EnsurePosModeNoStop(ax)) return;
+
+	StartAbsMoveWithProfile(ax, 0, 10000, 100, 100);
+
+	DWORD t0 = GetTickCount();
+	while (true) {
+		g_cm.GetStatus(&g_status);
+		long long ap = (long long)g_status.axesStatus[ax].actualPos;
+		int av = (int)std::lround(g_status.axesStatus[ax].actualVelocity);
+		if (std::llabs(ap - 0) <= 10 && std::abs(av) <= vel_idle_threshold) break;
+		if (GetTickCount() - t0 > 20000) break;
+		Sleep(10);
+	}
+}
+
+// 그립축: axis3, Open(0)
+static void GripOpen()
+{
+	if (!g_commStarted) return;
+	int ax = 3;
+	if (!EnsureServoOn(ax) || !EnsurePosModeNoStop(ax)) return;
+
+	StartAbsMoveWithProfile(ax, 0, 10000, 100, 100);
+
+	DWORD t0 = GetTickCount();
+	while (true) {
+		g_cm.GetStatus(&g_status);
+		long long ap = (long long)g_status.axesStatus[ax].actualPos;
+		int av = (int)std::lround(g_status.axesStatus[ax].actualVelocity);
+		if (std::llabs(ap - 0) <= 5 && std::abs(av) <= 5) break;
+		if (GetTickCount() - t0 > 20000) break;
+		Sleep(10);
+	}
+}
+
+// 그립축: axis3, Close(10000)
+static void GripClose()
+{
+	if (!g_commStarted) return;
+	int ax = 3;
+	if (!EnsureServoOn(ax) || !EnsurePosModeNoStop(ax)) return;
+
+	StartAbsMoveWithProfile(ax, 10000, 10000, 100, 100);
+
+	DWORD t0 = GetTickCount();
+	while (true) {
+		g_cm.GetStatus(&g_status);
+		long long ap = (long long)g_status.axesStatus[ax].actualPos;
+		int av = (int)std::lround(g_status.axesStatus[ax].actualVelocity);
+		if (std::llabs(ap - 10000) <= 5 && std::abs(av) <= 5) break;
+		if (GetTickCount() - t0 > 20000) break;
+		Sleep(10);
+	}
+}
+
+static void DoOhtAction_EStopAll() {
+	// 예시: 전체 급정지
+	for (int a = 0; a < 4; ++a) StopAxis(a);
+}
+
+
+// Periodic thread proc [NEW]
+void PeriodicThreadProc()
+{
+	while (g_periodicRun.load()) {
+		if (g_clientSock != INVALID_SOCKET) {
+			SendPeriodicStateFrame(g_clientSock);
+		}
+		for (int i = 0; i < 10 && g_periodicRun.load(); ++i) Sleep(100); // 1초
+	}
 }
 
 void PostTcpStateToMain(const wchar_t* msg)
@@ -1574,6 +2301,13 @@ static void CloseListen()
 		g_listenSock = INVALID_SOCKET;
 	}
 }
+
+// 보조 대기 함수들 (질문 본문과 동일) — WaitUntil, WaitTaskFinished, WaitAllAxesStopped 등
+extern bool WaitUntil(bool (*pred)(), DWORD timeoutMs, DWORD pollMs);
+extern bool WaitAllAxesStopped(double velEps, DWORD timeoutMs);
+extern bool WaitTaskFinished(TaskId id, DWORD timeoutMs, DWORD pollMs);
+
+std::atomic<bool> g_motionBusy{ false };
 
 void TcpServerThreadProc()
 {
@@ -1649,20 +2383,404 @@ void TcpServerThreadProc()
 		AppendLog(L"[TCP] Client connected");
 		PostTcpStateToMain(L"TCP: CLIENT CONNECTED");
 
+		// 연결되자마자 주기프레임 1번 즉시 전송
+		g_heartbeat = 0;
+		SendPeriodicStateFrame(g_clientSock);
+
+		// Periodic thread start
+		g_periodicRun = true;
+		g_heartbeat = 0;
+		std::thread th(PeriodicThreadProc);
+		th.detach();
+
 		char rbuf[512];
 		std::string line;
 
-		// "0" 명령 처리 공통 함수 (이제 텍스트는 안 보냄)
 		auto HandleCreateDevice = [&]() {
-			AppendLog(L"[RX] : Creating Device...");
-			if (InitDevice()) {
-				AppendLog(L"[RX] : Create Device Success");
-			}
-			else {
-				AppendLog(L"[RX] : Create Device Failed");
-			}
+			AppendLog(L"[BIN] CreateDevice (legacy) ignored in new protocol");
 			};
 
+		// 이벤트 프레임 처리
+		auto HandleEventFrame = [&](const unsigned char* f, int len) -> bool {
+			if (len < 6) return false;
+			if (f[0] != 0x02 || f[len - 1] != 0x03) return false;
+
+			unsigned char op = f[3];
+			unsigned char payLen = f[4];
+			int expected = 5 + payLen + 1;
+			if (expected != len) return false;
+
+			// 수신 프레임 로그
+			LogFrameHuman(f, len, L"[RX]");
+
+			bool ok = false;
+
+			switch (op) {
+				// ---------------- LOAD ----------------
+			case 0x21: // LOAD Request
+			{
+				AppendLog(L"[INFO] PLC -> PC : Load Request");
+
+				// 이미 다른 모션/시퀀스 동작 중이면 거부
+				bool expectedBusy = false;
+				if (!g_motionBusy.compare_exchange_strong(expectedBusy, true)) {
+					AppendLog(L"[BUSY] Load command ignored: motion already in progress");
+					return false;
+				}
+
+				// ACK 먼저
+				SendSimpleAck(g_clientSock, 0x21);
+				AppendLog(L"[TX] Load Request ACK sent");
+
+				SOCKET sockLoad = g_clientSock;
+				std::thread([sockLoad]() {
+					AppendLog(L"[ACT] Load Action Start");
+					StartDemoLoad(); // TaskId::DemoLoad 를 Running으로 세팅
+
+					bool okLoad = WaitTaskFinished(TaskId::DemoLoad, 120000);
+					if (!okLoad) {
+						AppendLog(L"[WARN] Load sequence timeout or failed");
+						// 실패시 Done은 보내지 않음 (현재 정책)
+					}
+					else {
+						AppendLog(L"[ACT] Load action complete (OK)");
+						SendSimpleDone(sockLoad, 0x21);
+						AppendLog(L"[TX] Load Done sent");
+					}
+
+					g_motionBusy.store(false);
+					}).detach();
+
+				return true;
+			}
+
+			// ---------------- UNLOAD ----------------
+			case 0x22: // UNLOAD Request
+			{
+				AppendLog(L"[INFO] PLC -> PC : Unload Request");
+
+				bool expectedBusy = false;
+				if (!g_motionBusy.compare_exchange_strong(expectedBusy, true)) {
+					AppendLog(L"[BUSY] Unload command ignored: motion already in progress");
+					return false;
+				}
+
+				SendSimpleAck(g_clientSock, 0x22);
+				AppendLog(L"[TX] Unload Request ACK sent");
+
+				SOCKET sockUnload = g_clientSock;
+				std::thread([sockUnload]() {
+					AppendLog(L"[ACT] Unload Action Start");
+					StartDemoUnload();
+
+					bool okUnload = WaitTaskFinished(TaskId::DemoUnload, 60000);
+					if (!okUnload) {
+						AppendLog(L"[WARN] Unload sequence timeout or failed");
+					}
+					else {
+						AppendLog(L"[ACT] Unload action complete (OK)");
+						SendSimpleDone(sockUnload, 0x22);
+						AppendLog(L"[TX] Unload Done sent");
+					}
+
+					g_motionBusy.store(false);
+					}).detach();
+
+				return true;
+			}
+
+			// ---------------- STOP (즉시 처리) ----------------
+			case 0x29: // 축정지
+				AppendLog(L"[INFO] PLC -> PC : Stop Motion Request");
+				SendSimpleAck(g_clientSock, 0x29);
+				AppendLog(L"[TX] Stop Request ACK sent");
+
+				DoStopAll(nullptr);
+				AppendLog(L"[ACT] All axes QuickStop executed");
+
+				if (WaitAllAxesStopped(1.0, 10000)) {
+					AppendLog(L"[INFO] All axes stopped (vel <= 1.0, Motioning OFF)");
+					SendSimpleDone(g_clientSock, 0x29);
+					AppendLog(L"[TX] Stop Done sent");
+					return true;
+				}
+				else {
+					AppendLog(L"[WARN] Stop timeout : some axes still moving or Motioning still ON");
+					return false;
+				}
+
+				// ---------------- RESET ----------------
+			case 0xFD: // 리셋
+				AppendLog(L"[INFO] PLC -> PC : Reset Request");
+				for (int a = 0; a < 4; ++a) {
+					g_cm.axisControl->ClearAmpAlarm(a);
+				}
+				SendSimpleAck(g_clientSock, 0xFD);
+				AppendLog(L"[TX] Reset ACK sent");
+				return true;
+
+				// ---------------- COMM OPEN ----------------
+			case 0xF0: // Comm Open
+				if (payLen >= 1 && f[5] == 0x01) {
+					AppendLog(L"[INFO] PLC -> PC : Comm Open (통신 오픈)");
+					PostTcpStateToMain(L"TCP: COMM OPEN");
+				}
+				else {
+					AppendLog(L"[WARN] Comm Open frame payload unexpected");
+				}
+				return true;
+
+				// ---------------- TRAVEL (Axis0) ----------------
+			case 0x2A: // 주행 포지션 기동
+			{
+				// 인터락 체크
+				if (!CheckInterlockBeforeAxisCommand(0)) {
+					AppendLog(L"[INTERLOCK] Axis0 blocked: Axis2 limit must be ON in Auto");
+					return false;
+				}
+
+				unsigned char posNo = (payLen >= 1) ? f[5] : 0;
+				wchar_t info[128];
+				swprintf_s(info, L"[INFO] PLC -> PC : Travel Position Command, Pos=%u", (unsigned)posNo);
+				AppendLog(info);
+
+				bool expectedBusy = false;
+				if (!g_motionBusy.compare_exchange_strong(expectedBusy, true)) {
+					AppendLog(L"[BUSY] Travel command ignored: motion already in progress");
+					return false;
+				}
+
+				// ACK 전송
+				SendSimpleAck(g_clientSock, 0x2A);
+				AppendLog(L"[TX] Travel Position ACK sent");
+
+				SOCKET sockTravel = g_clientSock;
+				std::thread([sockTravel, posNo]() {
+					bool okTravel = false;
+
+					switch (posNo) {
+					case 1:
+						AppendLog(L"[ACT] Travel Pos1 -> Conveyor");
+						GO_Conveyor();
+						okTravel = WaitTaskFinished(TaskId::GoConveyor, 30000);
+						AppendLog(okTravel
+							? L"[ACT] Travel Pos1 -> Conveyor DONE"
+							: L"[ACT] Travel Pos1 -> Conveyor FAILED or TIMEOUT");
+						break;
+					case 2:
+						AppendLog(L"[ACT] Travel Pos2 -> Workstation");
+						Go_Workstation();
+						okTravel = WaitTaskFinished(TaskId::GoWorkstation, 30000);
+						AppendLog(okTravel
+							? L"[ACT] Travel Pos2 -> Workstation DONE"
+							: L"[ACT] Travel Pos2 -> Workstation FAILED or TIMEOUT");
+						break;
+					case 3:
+						AppendLog(L"[WARN] Travel Pos3 not implemented");
+						okTravel = false;
+						break;
+					default:
+						AppendLog(L"[WARN] Travel Position invalid PosNo");
+						okTravel = false;
+						break;
+					}
+
+					if (okTravel) {
+						SendSimpleDone(sockTravel, 0x2A);
+						AppendLog(L"[TX] Travel Pos Done sent");
+					}
+
+					g_motionBusy.store(false);
+					}).detach();
+
+				return true;
+			}
+
+			// ---------------- HOIST (Axis2) ----------------
+			case 0x2B: // 상하 포지션 기동
+			{
+				if (!CheckInterlockBeforeAxisCommand(2)) {
+					AppendLog(L"[INTERLOCK] Axis2 blocked: Travel must be at Load/Unload in Auto");
+					return false;
+				}
+
+				unsigned char posNo = (payLen >= 1) ? f[5] : 0;
+				wchar_t info[128];
+				swprintf_s(info, L"[INFO] PLC -> PC : Hoist Position Command, Pos=%u", (unsigned)posNo);
+				AppendLog(info);
+
+				bool expectedBusy = false;
+				if (!g_motionBusy.compare_exchange_strong(expectedBusy, true)) {
+					AppendLog(L"[BUSY] Hoist command ignored: motion already in progress");
+					return false;
+				}
+
+				SendSimpleAck(g_clientSock, 0x2B);
+				AppendLog(L"[TX] Hoist Position ACK sent");
+
+				SOCKET sockHoist = g_clientSock;
+				std::thread([sockHoist, posNo]() {
+					bool okHoist = false;
+
+					switch (posNo) {
+					case 1:
+						AppendLog(L"[ACT] Hoist Pos1 -> Conveyor Down");
+						ConveyorDown();
+						okHoist = WaitTaskFinished(TaskId::ConveyorDown, 20000);
+						AppendLog(okHoist
+							? L"[ACT] Hoist Pos1 -> ConveyorDown DONE"
+							: L"[ACT] Hoist Pos1 -> ConveyorDown FAILED or TIMEOUT");
+						break;
+					case 2:
+						AppendLog(L"[ACT] Hoist Pos2 -> Work Down");
+						WorkDown();
+						okHoist = WaitTaskFinished(TaskId::WorkDown, 20000);
+						AppendLog(okHoist
+							? L"[ACT] Hoist Pos2 -> WorkDown DONE"
+							: L"[ACT] Hoist Pos2 -> WorkDown FAILED or TIMEOUT");
+						break;
+					case 3:
+						AppendLog(L"[ACT] Hoist Pos3 -> Up Position");
+						DoUp();
+						okHoist = WaitTaskFinished(TaskId::LiftUp, 20000);
+						AppendLog(okHoist
+							? L"[ACT] Hoist Pos3 -> Up DONE"
+							: L"[ACT] Hoist Pos3 -> Up FAILED or TIMEOUT");
+						break;
+					default:
+						AppendLog(L"[WARN] Hoist Position invalid PosNo");
+						okHoist = false;
+						break;
+					}
+
+					if (okHoist) {
+						SendSimpleDone(sockHoist, 0x2B);
+						AppendLog(L"[TX] Hoist Pos Done sent");
+					}
+
+					g_motionBusy.store(false);
+					}).detach();
+
+				return true;
+			}
+
+			// ---------------- GRIP ----------------
+			case 0x2C: // 그립 포지션 기동
+			{
+				unsigned char posNo = (payLen >= 1) ? f[5] : 0;
+				wchar_t info[128];
+				swprintf_s(info, L"[INFO] PLC -> PC : Grip Position Command, Pos=%u", (unsigned)posNo);
+				AppendLog(info);
+
+				// 모션 Busy 체크 (그립도 모션으로 간주)
+				bool expectedBusy = false;
+				if (!g_motionBusy.compare_exchange_strong(expectedBusy, true)) {
+					AppendLog(L"[BUSY] Grip command ignored: motion already in progress");
+					return false;
+				}
+
+				// ACK 전송
+				SendSimpleAck(g_clientSock, 0x2C);
+				AppendLog(L"[TX] Grip Position ACK sent");
+
+				SOCKET sockGrip = g_clientSock;
+				std::thread([sockGrip, posNo]() {
+					// 재진입 방지(그립 전용)
+					if (g_gripBusy) {
+						AppendLog(L"[BUSY] Grip command ignored: g_gripBusy == true");
+						g_motionBusy.store(false);
+						return;
+					}
+
+					bool okGrip = false;
+					bool motioning = g_diStable[0]; // Motioning 상태 (필요시 수정)
+
+					switch (posNo) {
+					case 1: // Open
+						if (HasBox()) {
+							AppendLog(L"[INTERLOCK] Grip Open blocked: HasBox()==true");
+							break;
+						}
+						if (IsGripperAlreadyOpen()) {
+							AppendLog(L"[SKIP] Grip already OPEN. No action performed.");
+							okGrip = true;
+							break;
+						}
+
+						AppendLog(L"[ACT] Grip Pos1 -> GripOpen");
+						g_gripBusy = true;
+
+						ToggleDO_HW(11, motioning, nullptr);
+						DoOpen_Compat(nullptr);
+						okGrip = WaitUntil(IsGripperOpenAndIdle, 10000);
+						ToggleDO_HW(11, motioning, nullptr);
+
+						g_gripBusy = false;
+						AppendLog(okGrip
+							? L"[ACT] Grip Pos1 -> Open DONE"
+							: L"[ACT] Grip Pos1 -> Open FAILED or TIMEOUT");
+						break;
+
+					case 2: // Close
+						if (IsGripperAlreadyClosed()) {
+							AppendLog(L"[SKIP] Grip already CLOSED. No action performed.");
+							okGrip = false;
+							break;
+						}
+
+						AppendLog(L"[ACT] Grip Pos2 -> GripClose");
+						g_gripBusy = true;
+						DoClose_Compat(nullptr);
+						okGrip = WaitUntil(IsGripperClosedAndIdle, 10000);
+						g_gripBusy = false;
+
+						AppendLog(okGrip
+							? L"[ACT] Grip Pos2 -> Close DONE"
+							: L"[ACT] Grip Pos2 -> Close FAILED or TIMEOUT");
+						break;
+
+					case 3:
+						AppendLog(L"[WARN] Grip Pos3 not implemented");
+						okGrip = false;
+						break;
+
+					default:
+						AppendLog(L"[WARN] Grip Position invalid PosNo");
+						okGrip = false;
+						break;
+					}
+
+					// 현재 프로토콜에서는 Grip에 대해 Done 프레임은 보내지 않고 ACK만 있는 상태 유지
+					g_motionBusy.store(false);
+					}).detach();
+
+				return true;
+			}
+
+			// ---------------- ACK ----------------
+			case 0xFF: // ACK
+				AppendLog(L"[INFO] PLC -> PC : ACK received");
+				if (payLen >= 1) {
+					unsigned char ackFor = f[5];
+					wchar_t info[128];
+					swprintf_s(info, L"[INFO] ACK for OP=0x%02X (%s)",
+						ackFor, DecodeOpName(ackFor));
+					AppendLog(info);
+				}
+				return true;
+
+				// ---------------- 기타 ----------------
+			default:
+			{
+				wchar_t info[128];
+				swprintf_s(info, L"[WARN] Unsupported OP=0x%02X (%s)", op, DecodeOpName(op));
+				AppendLog(info);
+			}
+			return false;
+			} // switch
+			}; // HandleEventFrame
+
+		// === RECV LOOP ===
 		while (g_tcpRunning.load()) {
 			int r = recv(g_clientSock, rbuf, sizeof(rbuf), 0);
 			if (r <= 0) {
@@ -1671,76 +2789,26 @@ void TcpServerThreadProc()
 				break;
 			}
 
-			// ===== RX RAW 로그 =====
+			// RAW 로그
 			{
-				wchar_t hexbuf[2048];
-				int wi = swprintf_s(hexbuf, L"[TCP RAW] (%d bytes) ", r);
-				for (int i = 0; i < r && wi < (int)_countof(hexbuf) - 4; ++i) {
-					wi += swprintf_s(hexbuf + wi,
-						_countof(hexbuf) - wi,
-						L"%02X ",
-						(unsigned char)rbuf[i]);
-				}
-				AppendLog(hexbuf);
-
-				wchar_t ascbuf[512];
-				int wlen = MultiByteToWideChar(CP_ACP, 0,
-					rbuf, r,
-					ascbuf, (int)_countof(ascbuf) - 1);
-				if (wlen > 0) {
-					ascbuf[wlen] = 0;
-					wchar_t msg[600];
-					swprintf_s(msg, L"[TCP RAW ASCII] %s", ascbuf);
-					AppendLog(msg);
-				}
+				unsigned char* p = (unsigned char*)rbuf;
+				LogFrameHuman(p, r, L"[RAW]");
 			}
 
-			// ===== 7바이트 바이너리 프레임 처리 =====
-			const unsigned char frameCreateDevice[7] =
-			{ 0x02, 0x00, 0x00, 0xFF, 0x01, 0x81, 0x03 };
-
-			if (r == 7 &&
-				(unsigned char)rbuf[0] == 0x02 &&
-				(unsigned char)rbuf[6] == 0x03)
-			{
-				if (memcmp(rbuf, frameCreateDevice, 7) == 0) {
-					AppendLog(L"[BIN] CreateDevice frame received");
-
-					// 1) InitDevice 실행
-					HandleCreateDevice();
-
-					// 2) 동일 프레임 에코 (순수 프레임만 전송)
-					int sent = send(g_clientSock, rbuf, r, 0);
-
-					// 3) TX 로그
-					if (sent == SOCKET_ERROR) {
-						AppendLog(L"[TX] Echo send failed");
-					}
-					else {
-						wchar_t txHex[2048];
-						int wi2 = swprintf_s(txHex, L"[TX RAW] (%d bytes) ", r);
-						for (int i = 0; i < r && wi2 < (int)_countof(txHex) - 4; ++i) {
-							wi2 += swprintf_s(txHex + wi2,
-								_countof(txHex) - wi2,
-								L"%02X ",
-								(unsigned char)rbuf[i]);
-						}
-						AppendLog(txHex);
-					}
-				}
-				else {
-					AppendLog(L"[BIN] Unknown 7-byte frame");
-				}
-
-				// 이 프레임은 바이너리로 처리했으니 아래 ASCII 파싱 스킵
+			// 7바이트 구버전
+			if (r == 7 && (unsigned char)rbuf[0] == 0x02 && (unsigned char)rbuf[6] == 0x03) {
+				HandleEventFrame((unsigned char*)rbuf, r);
 				continue;
 			}
-			// =======================================
 
-			// ===== (옵션) ASCII 라인 파싱 =====
-			// PLC가 전부 바이너리만 쓰면, 이 블록을 통째로 제거해도 됨.
+			// 새 이벤트 프레임
+			if (r >= 6 && (unsigned char)rbuf[0] == 0x02 && (unsigned char)rbuf[r - 1] == 0x03) {
+				HandleEventFrame((unsigned char*)rbuf, r);
+				continue;
+			}
+
+			// 텍스트 라인 파싱
 			line.append(rbuf, r);
-
 			size_t pos;
 			while ((pos = line.find_first_of("\r\n")) != std::string::npos) {
 				std::string one = line.substr(0, pos);
@@ -1760,91 +2828,25 @@ void TcpServerThreadProc()
 				wchar_t wline[256];
 				MultiByteToWideChar(CP_ACP, 0, one.c_str(), -1, wline, 256);
 				wchar_t wmsg[300];
-				swprintf_s(wmsg, L"[RX] %s", wline);
+				swprintf_s(wmsg, L"[RX ASCII] %s", wline);
 				AppendLog(wmsg);
 
-				// ★ 여기서는 더 이상 텍스트 응답을 보내지 않음
-				// std::string ack = "ACK:" + one + "\n";
-				// send(g_clientSock, ack.c_str(), (int)ack.size(), 0);
-
 				if (one == "0") {
-					HandleCreateDevice();  // 디버깅용으로 남겨둠
+					HandleCreateDevice();
 				}
 				else if (one == "1") {
-					AppendLog(L"[RX] : Starting Communication...");
-					bool ok = false;
-					if (!g_deviceOpened) {
-						AppendLog(L"[RX] : Communication Failed - Device not created");
-					}
-					else if (g_commStarted) {
-						AppendLog(L"[RX] : Communication already started");
-						ok = true;
-					}
+					if (!g_deviceOpened) AppendLog(L"[RX] : Device not created");
+					else if (g_commStarted) AppendLog(L"[RX] : Communication already started");
 					else {
-						ok = StartComm();
-						if (ok) {
-							AppendLog(L"[RX] : Communication Success");
-						}
-						else {
-							AppendLog(L"[RX] : Communication Failed");
-						}
+						bool okComm = StartComm();
+						AppendLog(okComm ? L"[RX] : Communication Success" : L"[RX] : Communication Failed");
 					}
-				}
-				else if (one == "2") {
-					if (g_commStarted) {
-						bool allServoOn = true;
-						for (int a = 0; a < 4; ++a) {
-							long e = g_cm.axisControl->SetServoOn(a, 1);
-							if (e != ErrorCode::None) {
-								allServoOn = false;
-								TCHAR msg[256];
-								_stprintf_s(msg, 256, TEXT("Servo ON Failed (축 %d)\n"), a);
-								ShowErrMsgBox(msg, e, g_wmx);
-								AppendLog(L"[RX] : Servo ON Failed");
-								break;
-							}
-						}
-						if (allServoOn) {
-							AppendLog(L"[RX] : All Servo on");
-						}
-					}
-				}
-				else if (one == "3") {
-					if (g_commStarted) {
-						bool anyFail = false;
-						for (int a = 0; a < 4; ++a) {
-							long e = g_cm.axisControl->SetServoOn(a, 0);
-							if (e != ErrorCode::None) {
-								anyFail = true;
-								TCHAR msg[256];
-								_stprintf_s(msg, 256, TEXT("Servo OFF Failed (축 %d)\n"), a);
-								ShowErrMsgBox(msg, e, g_wmx);
-								AppendLog(L"[RX] : Servo OFF Failed");
-								break;
-							}
-						}
-						if (!anyFail) {
-							AppendLog(L"[RX] : All Servo off");
-						}
-					}
-				}
-				else if (one == "4") {
-					if (g_commStarted && EnsureServoOn(1)) StartAbsMoveWithProfile(1, 20000, 10000.0, 100.0, 100.0);
-				}
-				else if (one == "5") {
-					if (g_commStarted && EnsureServoOn(2)) StartAbsMoveWithProfile(2, 30000, 10000.0, 100.0, 100.0);
-				}
-				else if (one == "6") {
-					if (g_commStarted && EnsureServoOn(3)) StartAbsMoveWithProfile(3, 40000, 10000.0, 100.0, 100.0);
-				}
-				else if (one == "7") {
-					if (g_commStarted && EnsureServoOn(0)) StartAbsMoveWithProfile(0, 30000, 8000.0, 100.0, 100.0);
-				}
-				else if (one == "8") {
-					if (g_commStarted && EnsureServoOn(0)) StartAbsMoveWithProfile(0, 40000, 8000.0, 100.0, 100.0);
 				}
 			}
 		}
+
+		// 클라이언트 종료 처리
+		g_periodicRun = false;
 		CloseClient();
 	}
 
@@ -1854,6 +2856,7 @@ void TcpServerThreadProc()
 	PostTcpStateToMain(L"TCP: STOPPED");
 	g_tcpRunning = false;
 }
+
 
 static void StartTcpServer()
 {
@@ -1866,6 +2869,7 @@ static void StopTcpServer()
 {
 	if (!g_tcpRunning.load()) return;
 	g_tcpRunning = false;
+	g_periodicRun = false;
 	shutdown(g_listenSock, SD_BOTH);
 	shutdown(g_clientSock, SD_BOTH);
 	CloseClient();
@@ -2611,6 +3615,7 @@ static int Sync_GetControlAxis(HWND hWnd) {
 }
 
 static void Sync_Control_Jog(HWND hWnd, int sign) {
+	if (!IsManualAllowed(hWnd)) return;
 	int ax = Sync_GetControlAxis(hWnd);
 
 	// Axis2 보호: 리밋 ON시 -방향 조그 차단
@@ -2646,6 +3651,7 @@ static void Sync_Control_Stop(HWND, int ax) {
 	g_cm.motion->Stop(ax); g_cm.velocity->Stop(ax); if (g_cm.torque) g_cm.torque->StopTrq(ax);
 }
 static void Sync_Control_Abs(HWND hWnd) {
+	if (!IsManualAllowed(hWnd)) return;
 	int ax = Sync_GetControlAxis(hWnd);
 	if (!EnsureServoOn(ax) || !EnsurePosModeNoStop(ax)) return;
 	double tgt = GetDlgDouble(hWnd, ID_SYNC_ABS_POS, 0.0);
@@ -2667,6 +3673,7 @@ static void Sync_Control_Abs(HWND hWnd) {
 	StartAbsMoveWithProfile(ax, (long long)std::llround(tgt), v, ta, td);
 }
 static void Sync_Control_Rel(HWND hWnd, int sign) {
+	if (!IsManualAllowed(hWnd)) return;
 	int ax = Sync_GetControlAxis(hWnd);
 	if (!EnsureServoOn(ax) || !EnsurePosModeNoStop(ax)) return;
 	double step = GetDlgDouble(hWnd, ID_SYNC_REL_STEP, 0.0) * sign;
@@ -3276,13 +4283,19 @@ static void UpdateStatus(HWND hWnd) {
 			SetWindowText(hTxt, TEXT("-"));
 		}
 	}
+	if (HWND h = GetDlgItem(hWnd, ID_TXT_AX2_LIMIT)) {
+		SetWindowText(h, g_ax2ServoReady ? (g_ax2LimitOn ? TEXT("ON") : TEXT("OFF")) : TEXT("WAIT"));
+	}
+	if (HWND h = GetDlgItem(hWnd, ID_TXT_AX2_HOME)) {
+		SetWindowText(h, g_ax2ServoReady ? (g_ax2HomeOn ? TEXT("ON") : TEXT("OFF")) : TEXT("WAIT"));
+	}
+	if (HWND h = GetDlgItem(hWnd, ID_TXT_MODE_STATE)) {
+		SetWindowText(h, g_autoMode ? TEXT("MODE: AUTO") : TEXT("MODE: MANUAL"));
+	}
 
 	UpdateEStopUi(hWnd, false);
 	UpdateTcpUiState(hWnd);
 }
-
-// ------------------ Serial Monitor Window ------------------
-static HWND g_hSerialWnd = nullptr;
 
 void EnsureDirW(const wchar_t* path) {
 	if (!path || !path[0]) return;
@@ -3352,7 +4365,8 @@ static LRESULT CALLBACK SerialWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
 	}
 
 	case WM_CLOSE:
-		StopTcpServer();
+		// 닫을 때 그냥 숨기기
+		ShowWindow(hWnd, SW_HIDE);
 		DestroyWindow(hWnd);
 		return 0;
 
@@ -3610,8 +4624,8 @@ void DetectAndLog()
 	for (int a = 0; a < 4; ++a) {
 		// current instant data
 		int cur = 0, trq = 0;
-		ReadAxis_TxPDO_2181_ActualCurrent(kAxisSlaveId[a], cur);
-		ReadAxis_TxPDO_6077_TorqueActual(kAxisSlaveId[a], trq);
+		//ReadAxis_TxPDO_2181_ActualCurrent(kAxisSlaveId[a], cur);
+		//ReadAxis_TxPDO_6077_TorqueActual(kAxisSlaveId[a], trq);
 		long long actPos = (long long)g_status.axesStatus[a].actualPos;
 		long long cmdPos = (long long)g_status.axesStatus[a].posCmd;
 
@@ -3671,8 +4685,8 @@ void DetectAndLog()
 				doneR.vel = ci.vel;
 				doneR.acc = ci.acc;
 				doneR.dec = ci.dec;
-				ReadAxis_TxPDO_2181_ActualCurrent(kAxisSlaveId[a], doneR.actualCurrent);
-				ReadAxis_TxPDO_6077_TorqueActual(kAxisSlaveId[a], doneR.torqueActual);
+				//ReadAxis_TxPDO_2181_ActualCurrent(kAxisSlaveId[a], doneR.actualCurrent);
+				//ReadAxis_TxPDO_6077_TorqueActual(kAxisSlaveId[a], doneR.torqueActual);
 				doneR.loadPercent = TorqueToLoadPercent(doneR.torqueActual);
 				doneR.cmdTick = ci.startTick;
 				doneR.doneTick = ci.endTick;
@@ -4202,22 +5216,41 @@ void HBC_Poll(HWND hWnd)
 	long long bcErr = g_hbc.targetBarcodeAbs - now6063;
 	long long eAbs = llabs(bcErr);
 
-	if (!g_hbc.stopDelayActive && eAbs <= g_hbc.deadband) {
-		g_hbc.stopDelayActive = true;
-		g_hbc.stopDelayTimer = 70; // 30ms × 70 = 2100ms (대략 2.1초)
-		return;
-	}
-	if (g_hbc.stopDelayActive) {
-		g_hbc.stopDelayTimer--;
+	// deadband 안에 있는지 여부
+	bool inDeadband = (eAbs <= g_hbc.deadband);
 
-		if (g_hbc.stopDelayTimer <= 0) {
-			g_hbc.running = false;
-			g_hbc.inCorr = false;
-			// 여기서도 초기화
-			g_hbc.stopDelayActive = false;
-			g_hbc.stopDelayTimer = 0;
+	if (inDeadband)
+	{
+		// deadband 최초 진입 시 타이머 세팅
+		if (!g_hbc.stopDelayActive)
+		{
+			g_hbc.stopDelayActive = true;
+
+			// 새 시퀀스 시작 시 Start 쪽에서 stopDelayTimer를 0으로 초기화해 둔다고 가정
+			// 0일 때만 70으로 세팅해서 "누적" 개념 유지
+			if (g_hbc.stopDelayTimer == 0)
+				g_hbc.stopDelayTimer = 70;   // 30ms × 70 ≒ 2.1s
+		}
+
+		// deadband 안에 있는 동안에만 타이머 감소
+		if (g_hbc.stopDelayActive)
+		{
+			if (--g_hbc.stopDelayTimer <= 0)
+			{
+				g_hbc.running = false;
+				g_hbc.inCorr = false;
+				g_hbc.stopDelayActive = false;
+				g_hbc.stopDelayTimer = 0;
+				return;    // 여기서 종료
+			}
 		}
 	}
+	else
+	{
+		// deadband 밖: 타이머는 멈춰 있고 값만 유지 (pause)
+		// g_hbc.stopDelayActive / stopDelayTimer 둘 다 건드리지 않음
+	}
+
 
 	// ============ ENTER CORR ============
 	if (!g_hbc.inCorr && eAbs <= g_hbc.startBcErr) {
@@ -4654,12 +5687,18 @@ static void CreateAxisGroup(HWND parent, int axis, int x, int y, int w, int h) {
 	HWND hJogM = CreateWindow(TEXT("BUTTON"), TEXT("Jog -"), WS_CHILD | WS_VISIBLE, nextX + 325, gy + padT, 80, 28, parent, (HMENU)(INT_PTR)ID_BTN_JOGM_A(axis), nullptr, nullptr);
 	CreateWindow(TEXT("BUTTON"), TEXT("Stop"), WS_CHILD | WS_VISIBLE, nextX + 410, gy + padT, 80, 28, parent, (HMENU)(INT_PTR)ID_BTN_STOP_A(axis), nullptr, nullptr);
 
+	// Jog 버튼: 자동 모드에서 눌리면 즉시 무시
 	if (hJogP) {
 		JogBtnCtx* c = new JogBtnCtx; c->axis = axis; c->sign = +1; c->isMulti = false; SetWindowSubclass(hJogP, [](HWND hBtn, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)->LRESULT {
 			JogBtnCtx* ctx = reinterpret_cast<JogBtnCtx*>(dwRefData);
 			HWND hParent = GetParent(hBtn);
 			switch (msg) {
-			case WM_LBUTTONDOWN: { if (ctx->isMulti) {} else { if (g_multiJogActive) StopMultiJog(); if (g_jogActiveAxis >= 0) StopJogIfActive(); StartJog(hParent, ctx->axis, ctx->sign); } SetCapture(hBtn); return 0; }
+			case WM_LBUTTONDOWN: {
+				if (g_autoMode.load()) { MessageBeep(MB_ICONWARNING); return 0; }
+				if (ctx->isMulti) {}
+				else { if (g_multiJogActive) StopMultiJog(); if (g_jogActiveAxis >= 0) StopJogIfActive(); StartJog(hParent, ctx->axis, ctx->sign); }
+				SetCapture(hBtn); return 0;
+			}
 			case WM_LBUTTONUP:
 			case WM_CAPTURECHANGED: { if (ctx->isMulti) {} else StopJogIfActive(); ReleaseCapture(); return 0; }
 			case WM_KEYDOWN: if (wParam == VK_SPACE || wParam == VK_RETURN) { SendMessage(hBtn, WM_LBUTTONDOWN, 0, 0); return 0; } break;
@@ -4674,7 +5713,12 @@ static void CreateAxisGroup(HWND parent, int axis, int x, int y, int w, int h) {
 			JogBtnCtx* ctx = reinterpret_cast<JogBtnCtx*>(dwRefData);
 			HWND hParent = GetParent(hBtn);
 			switch (msg) {
-			case WM_LBUTTONDOWN: { if (ctx->isMulti) {} else { if (g_multiJogActive) StopMultiJog(); if (g_jogActiveAxis >= 0) StopJogIfActive(); StartJog(hParent, ctx->axis, ctx->sign); } SetCapture(hBtn); return 0; }
+			case WM_LBUTTONDOWN: {
+				if (g_autoMode.load()) { MessageBeep(MB_ICONWARNING); return 0; }
+				if (ctx->isMulti) {}
+				else { if (g_multiJogActive) StopMultiJog(); if (g_jogActiveAxis >= 0) StopJogIfActive(); StartJog(hParent, ctx->axis, ctx->sign); }
+				SetCapture(hBtn); return 0;
+			}
 			case WM_LBUTTONUP:
 			case WM_CAPTURECHANGED: { if (ctx->isMulti) {} else StopJogIfActive(); ReleaseCapture(); return 0; }
 			case WM_KEYDOWN: if (wParam == VK_SPACE || wParam == VK_RETURN) { SendMessage(hBtn, WM_LBUTTONDOWN, 0, 0); return 0; } break;
@@ -4732,6 +5776,12 @@ static void CreateUI(HWND h) {
 	CreateWindow(TEXT("BUTTON"), TEXT("비상정지"), WS_CHILD | WS_VISIBLE, 620, 10, 100, 30, h, (HMENU)(INT_PTR)ID_BTN_ESTOP_TOGGLE, nullptr, nullptr);
 	CreateWindow(TEXT("STATIC"), TEXT("NORMAL"), WS_CHILD | WS_VISIBLE | SS_LEFT | WS_BORDER, 725, 12, 110, 24, h, (HMENU)(INT_PTR)ID_TXT_ESTOP_STATE, nullptr, nullptr);
 
+	// NEW: Mode buttons and state
+	CreateWindow(TEXT("BUTTON"), TEXT("Manual Mode"), WS_CHILD | WS_VISIBLE, 350, 900, 110, 30, h, (HMENU)ID_BTN_MODE_MANUAL, nullptr, nullptr);
+	CreateWindow(TEXT("BUTTON"), TEXT("Auto Mode"), WS_CHILD | WS_VISIBLE, 465, 900, 110, 30, h, (HMENU)ID_BTN_MODE_AUTO, nullptr, nullptr);
+	CreateWindow(TEXT("STATIC"), TEXT("MODE: MANUAL"), WS_CHILD | WS_VISIBLE | SS_LEFT | WS_BORDER, 580, 902, 140, 24, h, (HMENU)ID_TXT_MODE_STATE, nullptr, nullptr);
+
+
 	// Error Manual 버튼
 	CreateWindow(TEXT("BUTTON"), TEXT("Fastech Error Manual"), WS_CHILD | WS_VISIBLE, 750, 900, 160, 30, h, (HMENU)(INT_PTR)ID_BTN_FASTECH_MANUAL, nullptr, nullptr);
 	CreateWindow(TEXT("BUTTON"), TEXT("Welcon Error Manual"), WS_CHILD | WS_VISIBLE, 915, 900, 160, 30, h, (HMENU)(INT_PTR)ID_BTN_WELCON_MANUAL, nullptr, nullptr);
@@ -4752,11 +5802,11 @@ static void CreateUI(HWND h) {
 	CreateWindow(TEXT("STATIC"), TEXT("-"), WS_CHILD | WS_VISIBLE | SS_LEFT | WS_BORDER, 1570, 47, 140, 24, h, (HMENU)(INT_PTR)ID_TXT_ECAT_6063, nullptr, nullptr);
 
 	// Axis2 Limit/Home 상태 표시
-	CreateWindow(TEXT("STATIC"), TEXT("A2 Limit:"), WS_CHILD | WS_VISIBLE | SS_LEFT, 1500, 80, 70, 20, h, nullptr, nullptr, nullptr);
-	CreateWindow(TEXT("STATIC"), TEXT("-"), WS_CHILD | WS_VISIBLE | SS_LEFT | WS_BORDER, 1570, 77, 140, 24, h, (HMENU)(INT_PTR)ID_TXT_AX2_LIMIT, nullptr, nullptr);
+	CreateWindow(TEXT("STATIC"), TEXT("A2 Limit:"), WS_CHILD | WS_VISIBLE | SS_LEFT, 1400, 910, 70, 20, h, nullptr, nullptr, nullptr);
+	CreateWindow(TEXT("STATIC"), TEXT("-"), WS_CHILD | WS_VISIBLE | SS_LEFT | WS_BORDER, 1470, 907, 140, 24, h, (HMENU)(INT_PTR)ID_TXT_AX2_LIMIT, nullptr, nullptr);
 
-	CreateWindow(TEXT("STATIC"), TEXT("A2 Home:"), WS_CHILD | WS_VISIBLE | SS_LEFT, 1500, 110, 70, 20, h, nullptr, nullptr, nullptr);
-	CreateWindow(TEXT("STATIC"), TEXT("-"), WS_CHILD | WS_VISIBLE | SS_LEFT | WS_BORDER, 1570, 107, 140, 24, h, (HMENU)(INT_PTR)ID_TXT_AX2_HOME, nullptr, nullptr);
+	CreateWindow(TEXT("STATIC"), TEXT("A2 Home:"), WS_CHILD | WS_VISIBLE | SS_LEFT, 1400, 940, 70, 20, h, nullptr, nullptr, nullptr);
+	CreateWindow(TEXT("STATIC"), TEXT("-"), WS_CHILD | WS_VISIBLE | SS_LEFT | WS_BORDER, 1470, 937, 140, 24, h, (HMENU)(INT_PTR)ID_TXT_AX2_HOME, nullptr, nullptr);
 
 	int x = 10, y = 70, w = 1800, hgt = 120, gap = 6;
 	for (int a = 0; a < 4; ++a) CreateAxisGroup(h, a, x, y + a * (hgt + gap), w, hgt);
@@ -4788,10 +5838,11 @@ static void CreateUI(HWND h) {
 
 	CreateStatusTable(h, 10, gy + 160, 1760, 300);
 
+	// Multi Jog 버튼: 자동 모드에서 눌리면 즉시 무시
 	if (hMJp) {
 		JogBtnCtx* c = new JogBtnCtx; c->axis = -1; c->sign = +1; c->isMulti = true;
 		SetWindowSubclass(hMJp, [](HWND hBtn, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)->LRESULT {
-			if (msg == WM_LBUTTONDOWN) { StartMultiJog(GetParent(hBtn), +1); SetCapture(hBtn); return 0; }
+			if (msg == WM_LBUTTONDOWN) { if (g_autoMode.load()) { MessageBeep(MB_ICONWARNING); return 0; } StartMultiJog(GetParent(hBtn), +1); SetCapture(hBtn); return 0; }
 			if (msg == WM_LBUTTONUP || msg == WM_CAPTURECHANGED) { StopMultiJog(); ReleaseCapture(); return 0; }
 			if (msg == WM_KEYDOWN && (wParam == VK_SPACE || wParam == VK_RETURN)) { SendMessage(hBtn, WM_LBUTTONDOWN, 0, 0); return 0; }
 			if (msg == WM_KEYUP && (wParam == VK_SPACE || wParam == VK_RETURN)) { SendMessage(hBtn, WM_LBUTTONUP, 0, 0); return 0; }
@@ -4802,7 +5853,7 @@ static void CreateUI(HWND h) {
 	if (hMJm) {
 		JogBtnCtx* c = new JogBtnCtx; c->axis = -1; c->sign = -1; c->isMulti = true;
 		SetWindowSubclass(hMJm, [](HWND hBtn, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)->LRESULT {
-			if (msg == WM_LBUTTONDOWN) { StartMultiJog(GetParent(hBtn), -1); SetCapture(hBtn); return 0; }
+			if (msg == WM_LBUTTONDOWN) { if (g_autoMode.load()) { MessageBeep(MB_ICONWARNING); return 0; } StartMultiJog(GetParent(hBtn), -1); SetCapture(hBtn); return 0; }
 			if (msg == WM_LBUTTONUP || msg == WM_CAPTURECHANGED) { StopMultiJog(); ReleaseCapture(); return 0; }
 			if (msg == WM_KEYDOWN && (wParam == VK_SPACE || wParam == VK_RETURN)) { SendMessage(hBtn, WM_LBUTTONDOWN, 0, 0); return 0; }
 			if (msg == WM_KEYUP && (wParam == VK_SPACE || wParam == VK_RETURN)) { SendMessage(hBtn, WM_LBUTTONUP, 0, 0); return 0; }
@@ -4811,6 +5862,109 @@ static void CreateUI(HWND h) {
 			}, 0x2001, (DWORD_PTR)c);
 	}
 }
+
+// 한 통신 주기 이상 기다리기 위한 헬퍼
+static void WaitOneCommCycle()
+{
+	// 통신주기가 1ms 근처라면 10ms 정도면 충분히 여유 있음
+	Sleep(10);
+}
+
+static void AutoStart(HWND hWnd)
+{
+	// 이미 한 번 수행했다면 스킵
+	bool expected = false;
+	if (!g_autoStartDone.compare_exchange_strong(expected, true)) {
+		return;
+	}
+
+	// UI가 안정화될 시간을 충분히 둡니다. (서비스/드라이버 준비 포함)
+	Sleep(1500);
+
+	// 이미 열린 경우는 스킵
+	if (!g_deviceOpened) {
+		if (!InitDevice()) {
+			MessageBox(hWnd, TEXT("AutoStart: CreateDevice 실패. (다른 인스턴스가 이미 사용 중이거나 드라이버 초기화 지연일 수 있습니다)\r\n"
+				"프로그램을 다시 실행하거나 관리자 권한으로 실행해 보세요."),
+				TEXT("AutoStart"), MB_ICONERROR);
+			return;
+		}
+	}
+
+	Sleep(200); // 한 틱 대기
+
+	if (!g_commStarted) {
+		if (!StartComm()) {
+			MessageBox(hWnd, TEXT("AutoStart: StartCommunication 실패."), TEXT("AutoStart"), MB_ICONERROR);
+			return;
+		}
+		Sleep(50);
+	}
+
+	// Servo ON
+	/*for (int a = 0; a < 4; ++a) {
+		EnsureServoOn(a);
+		EnsurePosModeNoStop(a);
+	}*/
+
+	// Servo ON
+	/*EnsureServoOn(0);
+	EnsurePosModeNoStop(0);*/
+
+	//// 5초 대기
+	//std::this_thread::sleep_for(std::chrono::seconds(5));
+
+	//EnsureServoOn(1);
+	//EnsurePosModeNoStop(1);
+
+	// 5초 대기
+	//std::this_thread::sleep_for(std::chrono::seconds(5));
+
+	// 그 다음 2번 서보 ON
+	//EnsureServoOn(2);
+	//EnsurePosModeNoStop(2);
+
+	//// Sync Group 0: Master=0, Slave=[1]
+	//if (g_commStarted) {
+	//	Sync::SyncGroup grp{};
+	//	grp.masterAxis = 0;
+	//	grp.slaveAxisCount = 1;
+	//	grp.slaveAxis[0] = 1;
+	//	grp.servoOnOffSynchronization = 1;
+	//	grp.startupType = Sync::SyncGroupStartupType::Normal;
+	//	grp.gantryLoopCycleRatio = 1;
+	//	grp.maxCatchUpDistance = 0.0;
+	//	grp.catchUpVelocity = 0.0;
+	//	grp.catchUpAcc = 0.0;
+	//	grp.syncErrorTolerance = 1000.0;
+	//	grp.useMasterFeedback = 0;
+
+	//	Sync::SyncGroupStatus gst{};
+	//	if (g_cm.sync->GetSyncGroupStatus(0, &gst) == ErrorCode::None && gst.enabled) {
+	//		g_cm.sync->EnableSyncGroup(0, 0);
+	//		Sleep(10);
+	//	}
+
+	//	long se = g_cm.sync->SetSyncGroup(0, grp);
+	//	if (se == ErrorCode::None) {
+	//		Sleep(10);
+	//		Config::SyncParam sp{};
+	//		if (g_cm.config->GetSyncParam(grp.masterAxis, &sp) == ErrorCode::None) {
+	//			sp.masterDesyncDec = 10000.0;
+	//			sp.slaveDesyncDec = 10000.0;
+	//			g_cm.config->SetSyncParam(grp.masterAxis, &sp, nullptr);
+	//			Sleep(10);
+	//		}
+	//		g_cm.sync->EnableSyncGroup(0, 1);
+	//	}
+	//}
+	
+	PostMessage(hWnd, WM_APP_SHOW_DEMO_MIN, 0, 0);
+
+	UpdateEStopUi(hWnd, false);
+	UpdateTcpUiState(hWnd);
+}
+
 
 static void LaunchGPIOWindow() {
 	std::thread([] {
@@ -4830,15 +5984,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		SetTimer(hWnd, ID_TIMER, POLL_MS, nullptr);
 		UpdateEStopUi(hWnd, false);
 		UpdateTcpUiState(hWnd);
-		StartTcpServer(); // 자동 시작
 
-		// LOG/SCOPE: thread start and critical section
+		// TCP 서버는 AutoStart 이후 시작하거나, 필요 시 아래 주석 해제
+		//StartTcpServer();
+
+		// LOG/SCOPE 스레드
 		InitializeCriticalSection(&g_logCs);
 		g_logThreadRun = true;
 		g_logThread = std::thread(LogThreadProc);
 		g_logThread.detach();
 
-		// Axis2 Limit/Home 상태 초기화
+		// Axis2 flags reset
 		g_ax2LimitOn = false;
 		g_ax2HomeOn = false;
 		g_ax2LimitLatched = false;
@@ -4848,13 +6004,64 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		g_ax2HomeDebounceOn = false;
 		g_ax2HomeLastTick = GetTickCount();
 		g_ax2HomeRampIssued = false;
+
+		// [AUTO] 실행 시 자동 초기화 (지연 증가)
+		std::thread([](HWND hMain) {
+			// UI/서비스 준비 시간
+			Sleep(500);
+			AutoStart(hMain);
+			// 창이 열릴 때 STO 펄스 1회 (오류 클리어)
+			ToggleDO_HW(10, true, hMain);
+
+			// AutoStart 후 TCP 시작 (원하면)
+			StartTcpServer();
+
+			ToggleDO_HW(11, false, hMain); // STO 펄스 1회 (오류 클리어)
+
+			}, hWnd).detach();
+
+		
+
 	}
 	return 0;
+	return 0;
+	case WM_APP_SHOW_DEMO_MIN:        // ★ AutoStart에서 날린 요청 처리
+		ShowDemoControlWindow(hWnd, true);   // 최소화 상태로 생성/표시
+		return 0;
 
 	case WM_COMMAND:
 	{
 		int id = LOWORD(wParam);
 		int code = HIWORD(wParam);
+
+		if (id == ID_BTN_MODE_MANUAL) {
+			SwitchToManual(hWnd);
+			if (HWND h = GetDlgItem(hWnd, ID_TXT_MODE_STATE)) SetWindowText(h, TEXT("MODE: MANUAL"));
+			return 0;
+		}
+
+		if (id == ID_BTN_MODE_AUTO) {
+			SwitchToAuto(hWnd);
+			if (HWND h = GetDlgItem(hWnd, ID_TXT_MODE_STATE)) SetWindowText(h, TEXT("MODE: AUTO"));
+			// Serial Monitor 창이 없으면 띄워준다
+			if (!g_hSerialWnd || !IsWindow(g_hSerialWnd)) {
+				WNDCLASS wc{}; wc.lpszClassName = TEXT("WMX3SerialWnd");
+				wc.lpfnWndProc = SerialWndProc; wc.hInstance = (HINSTANCE)GetWindowLongPtr(hWnd, GWLP_HINSTANCE);
+				wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+				wc.hbrBackground = (HBRUSH)(COLOR_3DFACE + 1);
+				RegisterClass(&wc);
+				g_hSerialWnd = CreateWindow(TEXT("WMX3SerialWnd"), TEXT("Serial Monitor (TCP)"),
+					WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_SIZEBOX,
+					CW_USEDEFAULT, CW_USEDEFAULT, 800, 400, hWnd, nullptr, wc.hInstance, nullptr);
+				ShowWindow(g_hSerialWnd, SW_SHOWNORMAL);
+				UpdateWindow(g_hSerialWnd);
+			}
+			else {
+				ShowWindow(g_hSerialWnd, SW_SHOWNORMAL);
+				SetForegroundWindow(g_hSerialWnd);
+			}
+			return 0;
+		}
 
 		if (id == ID_BTN_ESTOP_TOGGLE) { DoToggleEStop(hWnd, false); return 0; }
 
@@ -4870,6 +6077,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			return 0;
 		}
 		if (id == ID_BTN_CREATE_DEVICE) {
+			if (!IsManualAllowed(hWnd)) return 0;
 			KillTimer(hWnd, ID_TIMER);
 			bool ok = false;
 			if (g_deviceOpened) { MessageBox(hWnd, TEXT("Device already created."), TEXT("Info"), MB_ICONINFORMATION); ok = true; }
@@ -4878,6 +6086,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			return 0;
 		}
 		if (id == ID_BTN_START_COMM) {
+			if (!IsManualAllowed(hWnd)) return 0;
 			KillTimer(hWnd, ID_TIMER);
 			bool ok = false;
 			if (!g_deviceOpened) MessageBox(hWnd, TEXT("Create device first."), TEXT("Start Communication"), MB_ICONWARNING);
@@ -4889,21 +6098,25 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		}
 
 		if (id == ID_BTN_DEMO_MAIN) {
-			ShowDemoControlWindow(hWnd);
+			if (!IsManualAllowed(hWnd)) return 0;
+			ShowDemoControlWindow(hWnd, false);
 			return 0;
 		}
 		if (id == ID_BTN_GPIO_MAIN) {
+			if (!IsManualAllowed(hWnd)) return 0;
 			LaunchGPIOWindow();
 			return 0;
 		}
 
 		if (id == ID_BTN_DEMO2) {
+			if (!IsManualAllowed(hWnd)) return 0;
 			// CHANGED: Demo2는 Barcode 창 오픈
 			ShowBarcodeDemoWindow(hWnd);
 			return 0;
 		}
 
 		if (id == ID_BTN_SYNC_WINDOW) {
+			if (!IsManualAllowed(hWnd)) return 0;
 			if (!g_deviceOpened || !g_commStarted) {
 				MessageBox(hWnd, TEXT("Create device and start communication first."), TEXT("Sync Group"), MB_ICONWARNING);
 				return 0;
@@ -4951,6 +6164,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 		for (int a = 0; a < 4; ++a) {
 			if (id == ID_BTN_APPLY_ALT_A(a)) {
+				if (!IsManualAllowed(hWnd)) return 0;
 				int ecat6063 = 0;
 				bool ok = ReadAxis0_TxPDO_6063(ecat6063);
 				double alt = GetDlgDouble(hWnd, ID_EDIT_ALTTGT_A(a), 0.0);
@@ -4965,22 +6179,24 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		}
 
 		for (int a = 0; a < 4; ++a) {
-			if (id == ID_BTN_SVON_A(a)) { long e = g_cm.axisControl->SetServoOn(a, 1); if (e != ErrorCode::None) ShowErrMsgBox(TEXT("Servo ON 실패"), e, g_wmx); return 0; }
-			if (id == ID_BTN_SVOFF_A(a)) { long e = g_cm.axisControl->SetServoOn(a, 0); if (e != ErrorCode::None) ShowErrMsgBox(TEXT("Servo OFF 실패"), e, g_wmx); return 0; }
+			if (id == ID_BTN_SVON_A(a)) { if (!IsManualAllowed(hWnd)) return 0; long e = g_cm.axisControl->SetServoOn(a, 1); if (e != ErrorCode::None) ShowErrMsgBox(TEXT("Servo ON 실패"), e, g_wmx); return 0; }
+			if (id == ID_BTN_SVOFF_A(a)) { if (!IsManualAllowed(hWnd)) return 0; long e = g_cm.axisControl->SetServoOn(a, 0); if (e != ErrorCode::None) ShowErrMsgBox(TEXT("Servo OFF 실패"), e, g_wmx); return 0; }
 			if (id == ID_BTN_HOME_A(a)) {
+				if (!IsManualAllowed(hWnd)) return 0;
 				if (!g_commStarted) { MessageBox(hWnd, TEXT("Start Communication first."), TEXT("Home"), MB_ICONWARNING); return 0; }
 				if (!EnsureServoOn(a)) return 0;
 				g_cm.motion->Stop(a); g_cm.velocity->Stop(a); if (g_cm.torque) g_cm.torque->StopTrq(a);
 				if (EnterPosMode(a)) { long e = g_home.StartHome(a); if (e != ErrorCode::None) ShowErrMsgBox(TEXT("Home 시작 실패"), e, g_wmx); }
 				return 0;
 			}
-			if (id == ID_BTN_ABS_A(a)) { if (g_demoRunning.load()) { MessageBox(hWnd, TEXT("Demo running. Stop demo first."), TEXT("Manual Move"), MB_ICONWARNING); return 0; } DoAbsMoveAxis(hWnd, a); return 0; }
-			if (id == ID_BTN_REL_A(a)) { if (g_demoRunning.load()) { MessageBox(hWnd, TEXT("Demo running. Stop demo first."), TEXT("Manual Move"), MB_ICONWARNING); return 0; } DoRelMoveAxis(hWnd, a, +1); return 0; }
-			if (id == ID_BTN_STOP_A(a)) { if (g_jogActiveAxis == a) StopJogIfActive(); StopAxis(a); return 0; }
+			if (id == ID_BTN_ABS_A(a)) { if (!IsManualAllowed(hWnd)) return 0; if (g_demoRunning.load()) { MessageBox(hWnd, TEXT("Demo running. Stop demo first."), TEXT("Manual Move"), MB_ICONWARNING); return 0; } DoAbsMoveAxis(hWnd, a); return 0; }
+			if (id == ID_BTN_REL_A(a)) { if (!IsManualAllowed(hWnd)) return 0; if (g_demoRunning.load()) { MessageBox(hWnd, TEXT("Demo running. Stop demo first."), TEXT("Manual Move"), MB_ICONWARNING); return 0; } DoRelMoveAxis(hWnd, a, +1); return 0; }
+			if (id == ID_BTN_STOP_A(a)) { if (!IsManualAllowed(hWnd)) return 0; if (g_jogActiveAxis == a) StopJogIfActive(); StopAxis(a); return 0; }
 		}
-		if (id == ID_BTN_MULTI_ABS) { if (g_demoRunning.load()) { MessageBox(hWnd, TEXT("Demo running. Stop demo first."), TEXT("Manual Move"), MB_ICONWARNING); return 0; } DoMultiAbs(hWnd); return 0; }
-		if (id == ID_BTN_MULTI_REL) { if (g_demoRunning.load()) { MessageBox(hWnd, TEXT("Demo running. Stop demo first."), TEXT("Manual Move"), MB_ICONWARNING); return 0; } DoMultiRel(hWnd); return 0; }
+		if (id == ID_BTN_MULTI_ABS) { if (!IsManualAllowed(hWnd)) return 0; if (g_demoRunning.load()) { MessageBox(hWnd, TEXT("Demo running. Stop demo first."), TEXT("Manual Move"), MB_ICONWARNING); return 0; } DoMultiAbs(hWnd); return 0; }
+		if (id == ID_BTN_MULTI_REL) { if (!IsManualAllowed(hWnd)) return 0; if (g_demoRunning.load()) { MessageBox(hWnd, TEXT("Demo running. Stop demo first."), TEXT("Manual Move"), MB_ICONWARNING); return 0; } DoMultiRel(hWnd); return 0; }
 		if (id == ID_BTN_MULTI_STOP) {
+			if (!IsManualAllowed(hWnd)) return 0;
 			g_demoRunning = false;
 			g_demoKind = DemoKind::None;
 			StopMultiJog();
@@ -4991,6 +6207,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			return 0;
 		}
 		if (id == ID_BTN_MULTI_HOME) {
+			if (!IsManualAllowed(hWnd)) return 0;
 			if (!g_commStarted) { MessageBox(hWnd, TEXT("Start Communication first."), TEXT("Home(Selected)"), MB_ICONWARNING); return 0; }
 			for (int a = 0; a < 4; ++a) if (IsAxisChecked(hWnd, a)) {
 				if (!EnsureServoOn(a)) continue;
@@ -5000,13 +6217,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			}
 			return 0;
 		}
-		if (id == ID_BTN_MULTI_SVON) { for (int a = 0; a < 4; ++a) if (IsAxisChecked(hWnd, a)) { long e = g_cm.axisControl->SetServoOn(a, 1); if (e != ErrorCode::None) ShowErrMsgBox(TEXT("Servo ON(Selected) 실패"), e, g_wmx); } return 0; }
-		if (id == ID_BTN_MULTI_SVOFF) { StopMultiJog(); for (int a = 0; a < 4; ++a) if (IsAxisChecked(hWnd, a)) { long e = g_cm.axisControl->SetServoOn(a, 0); if (e != ErrorCode::None) ShowErrMsgBox(TEXT("Servo OFF(Selected) 실패"), e, g_wmx); } return 0; }
-		if (id == ID_BTN_SELECT_ALL) { for (int a = 0; a < 4; ++a) SetAxisChecked(hWnd, a, true); UpdateSelectedAxesTextOnDemand(hWnd); return 0; }
-		if (id == ID_BTN_CLEAR_ALL) { for (int a = 0; a < 4; ++a) SetAxisChecked(hWnd, a, false); UpdateSelectedAxesTextOnDemand(hWnd); return 0; }
+		if (id == ID_BTN_MULTI_SVON) { if (!IsManualAllowed(hWnd)) return 0; for (int a = 0; a < 4; ++a) if (IsAxisChecked(hWnd, a)) { long e = g_cm.axisControl->SetServoOn(a, 1); if (e != ErrorCode::None) ShowErrMsgBox(TEXT("Servo ON(Selected) 실패"), e, g_wmx); } return 0; }
+		if (id == ID_BTN_MULTI_SVOFF) { if (!IsManualAllowed(hWnd)) return 0; StopMultiJog(); for (int a = 0; a < 4; ++a) if (IsAxisChecked(hWnd, a)) { long e = g_cm.axisControl->SetServoOn(a, 0); if (e != ErrorCode::None) ShowErrMsgBox(TEXT("Servo OFF(Selected) 실패"), e, g_wmx); } return 0; }
+		if (id == ID_BTN_SELECT_ALL) { if (!IsManualAllowed(hWnd)) return 0; for (int a = 0; a < 4; ++a) SetAxisChecked(hWnd, a, true); UpdateSelectedAxesTextOnDemand(hWnd); return 0; }
+		if (id == ID_BTN_CLEAR_ALL) { if (!IsManualAllowed(hWnd)) return 0; for (int a = 0; a < 4; ++a) SetAxisChecked(hWnd, a, false); UpdateSelectedAxesTextOnDemand(hWnd); return 0; }
 
-		if (id == ID_BTN_MULTI_ALARM_RST) { DoMultiAlarmReset(hWnd); return 0; }
-		if (id == ID_BTN_MAP_WINDOW) { ShowMapWindow(hWnd); return 0; }
+		if (id == ID_BTN_MULTI_ALARM_RST) { if (!IsManualAllowed(hWnd)) return 0; DoMultiAlarmReset(hWnd); return 0; }
+		if (id == ID_BTN_MAP_WINDOW) { if (!IsManualAllowed(hWnd)) return 0; ShowMapWindow(hWnd); return 0; }
 	}
 	return 0;
 
@@ -5088,6 +6305,19 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			g_cm.GetStatus(&g_status);
 			UpdateStatus(hWnd);
 
+			// ADDED: STO 펄스 자동 OFF (oht main에서 발생시킨 펄스)
+			if (g_ohtStoPulsePendingOff.load()) {
+				DWORD now = GetTickCount();
+				if (now - g_ohtStoPulseOnTick.load() >= kOhtStoPulseMs) {
+					g_ohtStoPulsePendingOff = false;
+					ToggleDO_HW(10, false, nullptr);
+				}
+			}
+
+			// IO 신호 새로고침(필요 시)
+			if (g_ioInitDone.load()) {
+				RefreshLevels(hWnd);
+			}
 
 			// ============================================
 			// 2) Axis2 ServoOn 체크 & 1초 지연 타이머

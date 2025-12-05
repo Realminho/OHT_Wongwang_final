@@ -73,7 +73,7 @@ bool DeInitilizeEAPI(void) {
     }
     return true;
 }
-bool EnumerateGPIO(void) {
+static bool EnumerateGPIO(void) {
     uint32_t status, supportPin, id;
     uint8_t found = 0;
     HINSTANCE hDLL = GetEAPIInstance();
@@ -402,7 +402,7 @@ static void UpdateDIText(int i, bool supported, bool level, HWND hWnd) {
         _stprintf_s(buf, _T("Motioning : %s"), showLevel ? _T("ON") : _T("OFF"));
     }
     else if (i == 1) {
-        _stprintf_s(buf, _T("Catched : %s"), showLevel ? _T("ON") : _T("OFF"));
+        _stprintf_s(buf, _T("Catched : %s"), showLevel ? _T("OFF") : _T("ON"));
     }
     else {
         _stprintf_s(buf, _T("Pin %d : %s"), i, showLevel ? _T("OFF") : _T("ON"));
