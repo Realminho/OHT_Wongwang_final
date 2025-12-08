@@ -35,7 +35,11 @@ extern bool ReadAxis_TxPDO_6063(int slaveId, int& outVal);
 extern const int kAxisSlaveId[4] = { 0, 1, 2, 3 };
 
 // 현재 위치(주행) 코드: Load=0x01, Unload=0x02, 그 외=0x00
-inline unsigned char CalcPosTravelCode();
+extern inline unsigned char CalcPosTravelCode();
+extern unsigned char CalcPosGripCode();
+
+extern inline bool IsAxis2LimitOn();
+
 
 // 외부 atEAPI
 #include "atEAPI.h"
@@ -1978,27 +1982,46 @@ void StartDemoLoad()
     //  - 축2가 Up 위치인지
     //  - 그리퍼가 Open 상태인지
     if (!CheckDemoLoadPreconditions()) {
+        // 일단 Load 시퀀스 자체는 실패로 표시
         SetTaskState(TaskId::DemoLoad, TaskState::Failed);
 
-        // 조건 불만족 시, 보유 상태에 맞춰 홈 시퀀스 자동 진입
-        if (HasBox()) {
-            // 박스를 들고 있으면 with Box 홈
-            // (홈 시퀀스 내부에서 조건 체크 및 TaskState 설정 수행)
-            //StartDemoHomeWithBox();
-        }
-        else {
-            // 박스가 없으면 without Box 홈
-            //StartDemoHomeWithoutBox();
+        // 1) Axis2가 Limit(Up) 상태가 아니면 먼저 Up으로 정리
+        if (!IsAxis2LimitOn()) {
+            DoUp();
+            (void)WaitUntil(IsAxis2Up, 20000);
         }
 
-        // 원하면 경고 메시지 추가 (옵션)
-        // if (g_hDemoWnd) {
-        //     MessageBox(g_hDemoWnd,
-        //         TEXT("Load 시퀀스를 시작할 수 없습니다.\n")
-        //         TEXT("조건: Axis0=Conveyor, Axis2=Up, Gripper=Open"),
-        //         TEXT("Demo Load"),
-        //         MB_ICONWARNING);
-        // }
+        // 2) 그리퍼 상태 확인
+        unsigned char gcode = CalcPosGripCode(); // 0x00이면 중간(애매한) 상태라고 가정
+
+        if (gcode == 0x00) {
+
+            // 2-1) 먼저 Close 쪽으로 정리
+            DoClose_Compat(g_hDemoWnd);
+            (void)WaitUntil(IsGripperClosedAndIdle, 5000);
+
+            // 2-2) Close 상태에서 Servo OFF
+            DoGripServoOff_Compat(g_hDemoWnd);
+
+            // 2-3) 박스 보유 여부 체크
+            if (HasBox()) {
+                // 박스 들고 있으면 Close+ServoOff 상태 유지하고 종료
+            }
+            else {
+
+                // 박스가 없다면 Open 상태로 정리
+                DoOpen_Compat(g_hDemoWnd);
+                (void)WaitUntil(IsGripperOpenAndIdle, 5000);
+
+                DoGripServoOff_Compat(g_hDemoWnd);
+            }
+        }
+        else {
+            // gcode != 0x00 이면 (이미 Open 또는 Close 쪽이라면) 추가 그리퍼 동작 없이 종료
+
+        }
+
+        // 여기서는 Load 시퀀스를 시작하지 않고 복구만 하고 종료
         return;
     }
 
@@ -2054,25 +2077,47 @@ void StartDemoUnload()
     if (!g_commStarted) { SetTaskState(TaskId::DemoUnload, TaskState::Failed); return; }
     if (g_taskStatus[(int)TaskId::DemoUnload].state.load() == TaskState::Running) return;
 
-    // ★ Unload 시작 전 조건 체크
-    if (!CheckDemoUnloadPreconditions()) {
-        SetTaskState(TaskId::DemoUnload, TaskState::Failed);
+    if (!CheckDemoLoadPreconditions()) {
+        // 일단 Load 시퀀스 자체는 실패로 표시
+        SetTaskState(TaskId::DemoLoad, TaskState::Failed);
 
-        // ★ 시퀀스 시작 전 상태 체크:
-        //  - 축0 바코드가 Conveyor 위치인지
-        //  - 축2가 Up 위치인지
-        //  - 그리퍼가 Close 상태인지
-            // 조건 불만족 시, 보유 상태에 맞춰 홈 시퀀스 자동 진입
-        if (HasBox()) {
-            // 박스를 들고 있으면 with Box Work
-            // (홈 시퀀스 내부에서 조건 체크 및 TaskState 설정 수행)
-            //StartDemoWorkWithBox();
+        // 1) Axis2가 Limit(Up) 상태가 아니면 먼저 Up으로 정리
+        if (!IsAxis2LimitOn()) {
+            DoUp();
+            (void)WaitUntil(IsAxis2Up, 20000);
+        }
+
+        // 2) 그리퍼 상태 확인
+        unsigned char gcode = CalcPosGripCode(); // 0x00이면 중간(애매한) 상태라고 가정
+
+        if (gcode == 0x00) {
+
+            // 2-1) 먼저 Close 쪽으로 정리
+            DoClose_Compat(g_hDemoWnd);
+            (void)WaitUntil(IsGripperClosedAndIdle, 5000);
+
+            // 2-2) Close 상태에서 Servo OFF
+            DoGripServoOff_Compat(g_hDemoWnd);
+
+            // 2-3) 박스 보유 여부 체크
+            if (HasBox()) {
+                // 박스 들고 있으면 Close+ServoOff 상태 유지하고 종료
+            }
+            else {
+
+                // 박스가 없다면 Open 상태로 정리
+                DoOpen_Compat(g_hDemoWnd);
+                (void)WaitUntil(IsGripperOpenAndIdle, 5000);
+
+                DoGripServoOff_Compat(g_hDemoWnd);
+            }
         }
         else {
-            // 박스가 없으면 without Box 홈
-            //StartDemoWorkWithoutBox();
+            // gcode != 0x00 이면 (이미 Open 또는 Close 쪽이라면) 추가 그리퍼 동작 없이 종료
+
         }
 
+        // 여기서는 Load 시퀀스를 시작하지 않고 복구만 하고 종료
         return;
     }
 

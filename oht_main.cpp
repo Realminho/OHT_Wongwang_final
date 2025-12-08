@@ -1252,7 +1252,7 @@ inline unsigned char CalcPosTravelCode()
 }
 
 // Axis2 리밋 센서 현재 상태
-static inline bool IsAxis2LimitOn()
+inline bool IsAxis2LimitOn()
 {
 	return ReadInputBit(AX2_LIMIT_ADDR, AX2_LIMIT_BIT, AX2_LIMIT_ACTIVE_HIGH);
 }
@@ -1901,7 +1901,7 @@ static unsigned char CalcPosHoistCode()
 	return 0x00;
 }
 
-static unsigned char CalcPosGripCode()
+unsigned char CalcPosGripCode()
 {
 	// 진행중이면 0x00
 	if (g_gripBusy.load()) return 0x00;
@@ -6095,111 +6095,152 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		g_ax2HomeLastTick = GetTickCount();
 		g_ax2HomeRampIssued = false;
 
-		// [AUTO] 실행 시 자동 초기화 (지연 증가)
+		//// [AUTO] 실행 시 자동 초기화 (지연 증가)
 		std::thread([](HWND hMain) {
-			// UI/서비스 준비 시간
+			bool setupOk = true;   // 전체 초기 세팅 성공 여부 플래그
+
+			// 1) UI/서비스 준비 시간
 			Sleep(500);
 			AutoStart(hMain);
-			// 창이 열릴 때 STO 펄스 1회 (오류 클리어)
-			//DoGripServoOff_Compat(hMain);
-			// AutoStart 후 TCP 시작 (원하면)
-			StartTcpServer();
 
+			// 2) AutoStart 후 TCP 시작
+			StartTcpServer();
+			Sleep(1000);
+
+		// 3) 그리퍼 상태 정리 (HasBox 기준)
 			bool okGrip = false;
-			// ★ 여기 조건문
-			if (HasBox()) {             // <- 괄호 꼭!
-				DoClose_Compat(hMain);  // <- 세미콜론 추가
+			if (HasBox()) {
+				AppendLog(L"[AUTO] HasBox()==true -> Grip Close + ServoOff");
+				DoClose_Compat(hMain);
 				okGrip = WaitUntil(IsGripperClosedAndIdle, 10000);
+				if (!okGrip) {
+					AppendLog(L"[AUTO][WARN] Grip Close or Idle wait FAILED");
+					setupOk = false;
+				}
 				DoGripServoOff_Compat(hMain);
 			}
 			else {
+				AppendLog(L"[AUTO] HasBox()==false -> Grip Open + ServoOff");
 				DoOpen_Compat(hMain);
 				okGrip = WaitUntil(IsGripperOpenAndIdle, 10000);
+				if (!okGrip) {
+					AppendLog(L"[AUTO][WARN] Grip Open or Idle wait FAILED");
+					setupOk = false;
+				}
 				DoGripServoOff_Compat(hMain);
 			}
 
-			Sleep(1000);
-			// -----------------------------
-			// 2) HasBox 상관없이 위치 정리 로직
-			//    - IsAxis2LimitOn() 기준 + 바코드 위치(476774)
-			//    - 축이 실제로 움직일 때는 DO11 ON, 끝나면 DO11 OFF
-			// -----------------------------
+			Sleep(2000);
+
+			// 4) HasBox 상관없이 위치 정리 로직
 			if (IsAxis2LimitOn()) {
 				AppendLog(L"[AUTO] Axis2 limit ON -> check travel barcode");
 
-				unsigned char code = CalcPosTravelCode(); // 0x01 = Load(476774), 0x02 = Unload(491332), etc.
+				//unsigned char code = CalcPosTravelCode(); // 0x01 = Load(476774), 0x02 = Unload(491332), etc.
 
-				if (code == 0x01) {
-					// 이미 Load 위치(476774) → 아무 동작 안 함
-					AppendLog(L"[AUTO] Travel at Load(476774) -> no travel move");
-				}
-				else {
-					// Limit ON인데 Load 위치가 아니면 Conveyor 위치로 이동
-					AppendLog(L"[AUTO] Axis2 limit ON & not at Load -> GO_Conveyor() with DO11");
+				//if (code == 0x01) {
+				//	// 이미 Load 위치(476774) → 주행 안 함
+				//	AppendLog(L"[AUTO] Travel at Load(476774) -> no travel move");
+				//}
+				//else {
+				//	// Limit ON인데 Load 위치가 아니면 Conveyor 위치로 이동
+				//	AppendLog(L"[AUTO] Axis2 limit ON & not at Load -> GO_Conveyor() with DO11");
 
-					// ★ 축 동작 시작: DO11 ON
-					ToggleDO_HW(11, true, hMain);
+				//	// 축 동작 시작: DO11 ON
+				//	//ToggleDO_HW(11, true, hMain);
 
-					GO_Conveyor();
-					bool okConv = WaitTaskFinished(TaskId::GoConveyor, 30000);
+				//	GO_Conveyor();
+				//	bool okConv = WaitTaskFinished(TaskId::GoConveyor, 30000);
 
-					AppendLog(okConv
-						? L"[AUTO] GO_Conveyor DONE"
-						: L"[AUTO] GO_Conveyor FAILED or TIMEOUT");
-					if(okConv) {
-						ToggleDO_HW(11, false, hMain);
-					}
-				}
+				//	AppendLog(okConv
+				//		? L"[AUTO] GO_Conveyor DONE"
+				//		: L"[AUTO][WARN] GO_Conveyor FAILED or TIMEOUT");
+
+				//	if (!okConv) {
+				//		setupOk = false;
+				//	}
+
+					// 동작 종료: DO11 OFF
+					//ToggleDO_HW(11, false, hMain);
+				//}
 			}
 			else {
-				AppendLog(L"[AUTO] Axis2 limit OFF -> DoUp() first with DO11");
+				AppendLog(L"[AUTO] Axis2 limit OFF -> Move Axis2 to -1000 with DO11");
 
-				// 1) 먼저 Up으로 올릴 때 DO11 ON
-				ToggleDO_HW(11, true, hMain);
+				// 1) Axis2를 -1000으로 이동 (직접 프로파일 명령 사용)
+				//ToggleDO_HW(11, true, hMain);
 
-				DoUp();
-				bool okUp = WaitTaskFinished(TaskId::LiftUp, 20000);
+				bool started = StartAbsMoveWithProfile(
+					2,          // axis
+					-1000,      // target position
+					3000.0,     // velocity
+					1000.0,     // tAcc (ms)
+					1000.0      // tDec (ms)
+				);
 
-				// Up 모션 끝났으니 DO11 OFF
-				ToggleDO_HW(11, false, hMain);
-
-				AppendLog(okUp
-					? L"[AUTO] DoUp DONE"
-					: L"[AUTO] DoUp FAILED or TIMEOUT");
-				if (okUp) {
-					ToggleDO_HW(11, false, hMain);
-				}
-
-				// 2) 다시 바코드 위치 확인
-				unsigned char code = CalcPosTravelCode(); // 0x01 = Load(476774)
-
-				if (code == 0x01) {
-					AppendLog(L"[AUTO] After DoUp: Travel at Load(476774) -> no travel move");
+				bool okAxis2 = false;
+				if (started) {
+					okAxis2 = WaitAllAxesStopped(1.0, 20000);
 				}
 				else {
-					AppendLog(L"[AUTO] After DoUp: not at Load -> GO_Conveyor() with DO11");
-
-					// Conveyor로 갈 때도 DO11 ON
-					ToggleDO_HW(11, true, hMain);
-
-					GO_Conveyor();
-					bool okConv = WaitTaskFinished(TaskId::GoConveyor, 30000);
-
-					// 동작 종료 시 DO11 OFF
-					ToggleDO_HW(11, false, hMain);
-
-					AppendLog(okConv
-						? L"[AUTO] GO_Conveyor DONE"
-						: L"[AUTO] GO_Conveyor FAILED or TIMEOUT");
-					if (okConv) {
-						ToggleDO_HW(11, false, hMain);
-					}
+					AppendLog(L"[AUTO][WARN] StartAbsMoveWithProfile(axis2) FAILED");
 				}
+
+				//ToggleDO_HW(11, false, hMain);
+
+				if (!started || !okAxis2) {
+					AppendLog(L"[AUTO][WARN] Axis2 move to -1000 FAILED or TIMEOUT");
+					setupOk = false;
+				}
+				else {
+					AppendLog(L"[AUTO] Axis2 move to -1000 DONE");
+				}
+
+				// 2) 다시 바코드 위치 확인 (주행 위치)
+				//unsigned char code = CalcPosTravelCode(); // 0x01 = Load(476774)
+
+				//if (code == 0x01) {
+				//	AppendLog(L"[AUTO] After Axis2 move: Travel at Load(476774) -> no travel move");
+				//}
+				//else {
+				//	AppendLog(L"[AUTO] After Axis2 move: not at Load -> GO_Conveyor() with DO11");
+
+				//	//ToggleDO_HW(11, true, hMain);
+
+				//	GO_Conveyor();
+				//	bool okConv = WaitTaskFinished(TaskId::GoConveyor, 30000);
+
+				//	AppendLog(okConv
+				//		? L"[AUTO] GO_Conveyor DONE"
+				//		: L"[AUTO][WARN] GO_Conveyor FAILED or TIMEOUT");
+
+				//	if (!okConv) {
+				//		setupOk = false;
+				//	}
+
+				//	//ToggleDO_HW(11, false, hMain);
+				//}
+			}
+
+			// 5) 전체 초기 세팅 완료 메시지 (성공/실패 분기)
+			if (setupOk) {
+				MessageBox(
+					hMain,
+					TEXT("초기 세팅이 정상적으로 완료되었습니다."),
+					TEXT("초기 세팅"),
+					MB_OK | MB_ICONINFORMATION
+				);
+			}
+			else {
+				MessageBox(
+					hMain,
+					TEXT("초기 세팅 중 일부 단계에서 오류가 발생했습니다.\n로그를 확인해 주세요."),
+					TEXT("초기 세팅 오류"),
+					MB_OK | MB_ICONWARNING
+				);
 			}
 
 		}, hWnd).detach();
-
-
 
 	}
 	return 0;
