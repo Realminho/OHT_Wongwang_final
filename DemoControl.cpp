@@ -1702,7 +1702,7 @@ void Go_Workstation() {
     BarcodeParams p{};
     p.axis = 0;
     p.targetBarcodeAbs = 491332;
-    p.mainVel = 15000.0; p.mainAcc = 1000.0; p.mainDec = 3000.0;
+    p.mainVel = 15000.0; p.mainAcc = 1500.0; p.mainDec = 3000.0;
     p.corrVel = 1000.0; p.corrAcc = 1000.0; p.corrDec = 2000.0;
     p.deadband = 2;
     p.gear = 4.3; p.wheelDia = 70.0; p.motorCpr = 10000.0; p.bcMmPerCnt = 0.1;
@@ -1713,7 +1713,7 @@ void GO_Conveyor() {
     BarcodeParams p{};
     p.axis = 0;
     p.targetBarcodeAbs = 476774;
-    p.mainVel = 15000.0; p.mainAcc = 1000.0; p.mainDec = 3000.0;
+    p.mainVel = 15000.0; p.mainAcc = 1500.0; p.mainDec = 3000.0;
     p.corrVel = 1000.0; p.corrAcc = 1000.0; p.corrDec = 2000.0;
     p.deadband = 2;
     p.gear = 4.3; p.wheelDia = 70.0; p.motorCpr = 10000.0; p.bcMmPerCnt = 0.1;
