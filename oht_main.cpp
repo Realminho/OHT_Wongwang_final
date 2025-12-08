@@ -6118,7 +6118,86 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				DoGripServoOff_Compat(hMain);
 			}
 
-			}, hWnd).detach();
+			Sleep(1000);
+			// -----------------------------
+			// 2) HasBox 상관없이 위치 정리 로직
+			//    - IsAxis2LimitOn() 기준 + 바코드 위치(476774)
+			//    - 축이 실제로 움직일 때는 DO11 ON, 끝나면 DO11 OFF
+			// -----------------------------
+			if (IsAxis2LimitOn()) {
+				AppendLog(L"[AUTO] Axis2 limit ON -> check travel barcode");
+
+				unsigned char code = CalcPosTravelCode(); // 0x01 = Load(476774), 0x02 = Unload(491332), etc.
+
+				if (code == 0x01) {
+					// 이미 Load 위치(476774) → 아무 동작 안 함
+					AppendLog(L"[AUTO] Travel at Load(476774) -> no travel move");
+				}
+				else {
+					// Limit ON인데 Load 위치가 아니면 Conveyor 위치로 이동
+					AppendLog(L"[AUTO] Axis2 limit ON & not at Load -> GO_Conveyor() with DO11");
+
+					// ★ 축 동작 시작: DO11 ON
+					ToggleDO_HW(11, true, hMain);
+
+					GO_Conveyor();
+					bool okConv = WaitTaskFinished(TaskId::GoConveyor, 30000);
+
+					AppendLog(okConv
+						? L"[AUTO] GO_Conveyor DONE"
+						: L"[AUTO] GO_Conveyor FAILED or TIMEOUT");
+					if(okConv) {
+						ToggleDO_HW(11, false, hMain);
+					}
+				}
+			}
+			else {
+				AppendLog(L"[AUTO] Axis2 limit OFF -> DoUp() first with DO11");
+
+				// 1) 먼저 Up으로 올릴 때 DO11 ON
+				ToggleDO_HW(11, true, hMain);
+
+				DoUp();
+				bool okUp = WaitTaskFinished(TaskId::LiftUp, 20000);
+
+				// Up 모션 끝났으니 DO11 OFF
+				ToggleDO_HW(11, false, hMain);
+
+				AppendLog(okUp
+					? L"[AUTO] DoUp DONE"
+					: L"[AUTO] DoUp FAILED or TIMEOUT");
+				if (okUp) {
+					ToggleDO_HW(11, false, hMain);
+				}
+
+				// 2) 다시 바코드 위치 확인
+				unsigned char code = CalcPosTravelCode(); // 0x01 = Load(476774)
+
+				if (code == 0x01) {
+					AppendLog(L"[AUTO] After DoUp: Travel at Load(476774) -> no travel move");
+				}
+				else {
+					AppendLog(L"[AUTO] After DoUp: not at Load -> GO_Conveyor() with DO11");
+
+					// Conveyor로 갈 때도 DO11 ON
+					ToggleDO_HW(11, true, hMain);
+
+					GO_Conveyor();
+					bool okConv = WaitTaskFinished(TaskId::GoConveyor, 30000);
+
+					// 동작 종료 시 DO11 OFF
+					ToggleDO_HW(11, false, hMain);
+
+					AppendLog(okConv
+						? L"[AUTO] GO_Conveyor DONE"
+						: L"[AUTO] GO_Conveyor FAILED or TIMEOUT");
+					if (okConv) {
+						ToggleDO_HW(11, false, hMain);
+					}
+				}
+			}
+
+		}, hWnd).detach();
 
 
 
