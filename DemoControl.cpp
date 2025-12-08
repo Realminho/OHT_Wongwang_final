@@ -34,6 +34,9 @@ extern void StopAxis(int axis);
 extern bool ReadAxis_TxPDO_6063(int slaveId, int& outVal);
 extern const int kAxisSlaveId[4] = { 0, 1, 2, 3 };
 
+// 현재 위치(주행) 코드: Load=0x01, Unload=0x02, 그 외=0x00
+inline unsigned char CalcPosTravelCode();
+
 // 외부 atEAPI
 #include "atEAPI.h"
 
@@ -1559,10 +1562,10 @@ bool WaitTaskFinished(TaskId id, DWORD timeoutMs, DWORD pollMs = 20)
 // Load 시퀀스 시작 전 조건 모두 만족하는지 확인
 static bool CheckDemoLoadPreconditions()
 {
-    if (!IsAxis0AtConveyorBarcode()) {
-        // LOG("DemoLoad NG: Axis0 not at Conveyor barcode");
-        return false;
-    }
+    //if (!IsAxis0AtConveyorBarcode()) {
+    //    // LOG("DemoLoad NG: Axis0 not at Conveyor barcode");
+    //    return false;
+    //}
 
     if (!IsAxis2Up()) {
         // LOG("DemoLoad NG: Axis2 not Up");
@@ -1589,9 +1592,9 @@ static bool CheckDemoLoadPreconditions()
 //  - 박스 있음 (Catched ON)
 static bool CheckDemoUnloadPreconditions()
 {
-    // 1) 축0이 Conveyor 바코드 위치인가?
-    if (!IsAxis0AtConveyorBarcode())
-        return false;
+    //// 1) 축0이 Conveyor 바코드 위치인가?
+    //if (!IsAxis0AtConveyorBarcode())
+    //    return false;
 
     // 2) 축2가 Up 위치인가?
     if (!IsAxis2Up())
@@ -2002,11 +2005,19 @@ void StartDemoLoad()
     SetTaskState(TaskId::DemoLoad, TaskState::Running);
     std::thread([]() {
         bool ok = true;
-
-        //// 1. 그리퍼 Open (박스 없음) → Open 상태까지 대기
-        //DoOpen_Compat(g_hDemoWnd);
-        //if (!WaitUntil(NoBox, 5000) || !WaitUntil(IsGripperOpenAndIdle, 5000))
-        //    ok = false;
+        unsigned char code = CalcPosTravelCode();
+        // 1. Conveyor 위치로 이동 (필요할 때만)
+        if (ok) {
+            if (code == 0x01) {
+            }
+            else {
+                GO_Conveyor();
+                if (!WaitUntil(IsAxis0AtConveyorBarcodeStopped, 30000)) {
+                    ok = false;
+                }
+				Sleep(1000);
+            }
+        }
 
         // 1. ConveyorDown (박스 높이로 하강)
         if (ok) {
@@ -2068,13 +2079,21 @@ void StartDemoUnload()
     SetTaskState(TaskId::DemoUnload, TaskState::Running);
     std::thread([]() {
         bool ok = true;
+        unsigned char code = CalcPosTravelCode();
 
-        // 1. Workstation 위치로 이동
-        Go_Workstation();
-        if (!WaitUntil(IsAxis0AtWorkstationBarcodeStopped, 30000))
-            ok = false;
+        // 1. Workstation 위치로 이동 (필요할 때만)
+        if (ok) {
+            if (code == 0x02) {
+                // 이미 Workstation 바코드 위치 → 이동 스킵
+            }
+            else {
+                Go_Workstation();
+                if (!WaitUntil(IsAxis0AtWorkstationBarcodeStopped, 30000))
+                    ok = false;
+            }
+            Sleep(1000);
+        }
 
-        Sleep(1000);
 
         // 2. WorkDown (작업 위치로 하강)
         if (ok) {

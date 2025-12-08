@@ -1242,7 +1242,7 @@ static bool DebounceReadSensor(Io& io, bool& stableOn, DWORD& lastChangeTick) {
 // ======================== 인터락 보조 함수들 ========================
 
 // 현재 위치(주행) 코드: Load=0x01, Unload=0x02, 그 외=0x00
-static inline unsigned char CalcPosTravelCode()
+inline unsigned char CalcPosTravelCode()
 {
 	int bc = 0;
 	if (!ReadAxis0_TxPDO_6063(bc)) return 0x00;
@@ -1878,7 +1878,7 @@ static inline bool BetweenTol(long long v, long long center, long long tol) {
 
 // 현재위치(주행) 계산: Axis0의 6063 기준
 // Load=01 (278000±10), Unload=02 (253381±10), 그 외 00
-static unsigned char CalcPosTravelCode(); // 위에서 정의됨
+unsigned char CalcPosTravelCode(); // 위에서 정의됨
 //static unsigned char CalcPosTravelCode()
 //{
 //	int bc = 0;
