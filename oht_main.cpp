@@ -4468,585 +4468,585 @@ static LRESULT CALLBACK SerialWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
 	return DefWindowProc(hWnd, msg, wParam, lParam);
 }
 
-// ------------------ (BEGIN) LOG/SCOPE BLOCK: integrated ------------------
-// WMX3 파일 로그 채널 설정
-const unsigned int kLogCh = 0; // 채널 0 사용
-bool g_wmxLogReady = false;
-
-// 로그 폴더 보장
-void EnsureLogsFolder() {
-	EnsureDirW(L"logs");
-}
-
-// CHANGED: Unified column order and header text (+ Target6063, Now6063)
-static const char* kCsvHeaders[] = {
-	"Axis","CmdPos","ActPos","CmdVel","CmdAcc","CmdDec",
-	"ActualCurrent","ActualTorque","LoadPercent",
-	"Target6063","Now6063",
-	"Done#","CmdTime","DoneTime"
-};
-
-// Log 클래스로 파일 로그 시작/옵션 설정
-void StartDataLogFile()
-{
-	if (!g_commStarted) return;
-
-	const wchar_t* dir = L"C:\\wmx3_logfile";
-	EnsureDirW(dir);
-
-	LogFilePathW pathW{};
-	wcsncpy_s(pathW.dirPath, dir, _TRUNCATE);
-	wcsncpy_s(pathW.fileName, L"motion.csv", _TRUNCATE);
-
-	LogChannelOptions opt{};
-	opt.maxLogFileSize = 4 * 1024 * 1024; // 4MB
-	opt.maxLogFileCount = 10;
-	opt.isRotateFile = true;
-	opt.stopLoggingOnBufferOverflow = false;
-	opt.samplingTimeMilliseconds = 0;
-	opt.samplingPeriodInCycles = 0;
-	opt.precision = 6;
-	opt.isDelimInLastCol = false;
-	strcpy_s(opt.delimiter, ",");
-	opt.triggerOnCondition = 0;
-	opt.triggerOnEvent = 0;
-	opt.triggerEventID = 0;
-
-	g_log.ResetLog(kLogCh);
-	g_log.SetLogOption(kLogCh, &opt);
-	g_log.SetLogFilePath(kLogCh, &pathW);
-	g_log.SetLogHeader(kLogCh, (char**)kCsvHeaders, (unsigned)std::size(kCsvHeaders));
-	g_log.StartLog(kLogCh);
-
-	g_wmxLogReady = true;
-}
-
-// 파일 로그 중지
-void StopDataLogFile()
-{
-	if (!g_wmxLogReady) return;
-	g_log.StopLog(kLogCh);
-	g_wmxLogReady = false;
-}
-
-// 로컬 메모리 로그(리스트뷰 표시용)
-struct LogRow {
-	int axis;
-	long long cmdPos;
-	long long actPos;
-	int vel;
-	int acc;
-	int dec;
-	int actualCurrent;
-	int torqueActual;
-	int loadPercent;
-
-	// CHANGED: add barcode fields
-	long long target6063; // target barcode (intended position in 0x6063 domain)
-	int now6063;          // current barcode read from 0x6063
-
-	unsigned long doneCount;
-	ULONGLONG cmdTick;
-	ULONGLONG doneTick;
-};
-CRITICAL_SECTION g_logCs;
-std::vector<LogRow> g_logBuffer;
-
-// CSV 저장 helpers
-std::wstring FormatTickToTimestamp(ULONGLONG /*tick*/) {
-	// tick 값은 상대시간이므로 사용자 가독성을 위해 저장 시점의 로컬 시간 사용
-	SYSTEMTIME st{};
-	GetLocalTime(&st);
-	wchar_t buf[64];
-	swprintf_s(buf, L"%04d.%02d.%02d_%02d:%02d:%02d.%03d",
-		st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-	return buf;
-}
-
-// CHANGED: 스냅샷 기반 CSV 저장, 동시성 안전 (+ barcode columns)
-bool SaveLogCSV(const wchar_t* path) {
-	// 폴더 보장
-	wchar_t dir[MAX_PATH]{};
-	wcsncpy_s(dir, path, _TRUNCATE);
-	PathRemoveFileSpecW(dir);
-	if (dir[0]) {
-		EnsureDirW(dir);
-	}
-	else {
-		EnsureLogsFolder();
-	}
-
-	// 스냅샷 생성
-	std::vector<LogRow> snap;
-	EnterCriticalSection(&g_logCs);
-	snap = g_logBuffer;
-	LeaveCriticalSection(&g_logCs);
-
-	std::ofstream f(path, std::ios::binary | std::ios::trunc);
-	if (!f.is_open()) {
-		return false;
-	}
-
-	// UTF-8 BOM
-	const unsigned char bom[3] = { 0xEF,0xBB,0xBF };
-	f.write((const char*)bom, 3);
-
-	auto ws2utf8 = [](const std::wstring& ws) {
-		if (ws.empty()) return std::string();
-		int sz = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, nullptr, 0, nullptr, nullptr);
-		if (sz <= 1) return std::string();
-		std::string out; out.resize(sz - 1);
-		WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, out.data(), sz, nullptr, nullptr);
-		return out;
-		};
-
-	auto writeQuoted = [&](const std::string& s) {
-		f.put('"');
-		for (char c : s) {
-			if (c == '"') f.put('"');
-			f.put(c);
-		}
-		f.put('"');
-		};
-
-	// header
-	for (size_t i = 0; i < std::size(kCsvHeaders); ++i) {
-		if (i) f << ",";
-		f << kCsvHeaders[i];
-	}
-	f << "\r\n";
-
-	// rows
-	for (const auto& r : snap) {
-		std::string sCmd = ws2utf8(FormatTickToTimestamp(r.cmdTick));
-		std::string sDone = ws2utf8(r.doneTick ? FormatTickToTimestamp(r.doneTick) : L"-");
-
-		f << r.axis << ","
-			<< r.cmdPos << ","
-			<< r.actPos << ","
-			<< r.vel << ","
-			<< r.acc << ","
-			<< r.dec << ","
-			<< r.actualCurrent << ","
-			<< r.torqueActual << ","
-			<< r.loadPercent << ","
-			<< r.target6063 << ","
-			<< r.now6063 << ","
-			<< r.doneCount << ",";
-		writeQuoted(sCmd);
-		f << ",";
-		writeQuoted(sDone);
-		f << "\r\n";
-	}
-
-	f.close();
-	return true;
-}
-
-// 명령 시작시 기록 도우미
-bool StartAbsMoveWithProfile_LogTrack(int axis, long long target, double vpps, double tAcc, double tDec) {
-	bool ok = StartAbsMoveWithProfile(axis, target, vpps, tAcc, tDec);
-	if (ok) {
-		g_axisCmdInfo[axis].axis = axis;
-		g_axisCmdInfo[axis].target = target;
-		g_axisCmdInfo[axis].vel = (int)std::lround(vpps);
-		g_axisCmdInfo[axis].acc = TimeMsToAcc(vpps, tAcc);
-		g_axisCmdInfo[axis].dec = TimeMsToAcc(vpps, tDec);
-		g_axisCmdInfo[axis].startTick = GetTickCount64();
-		g_axisCmdInfo[axis].active = true;
-		g_axisCmdInfo[axis].endTick = 0;
-
-		// CHANGED: resume logging
-		g_axisLogEnabled[axis] = true;
-		g_axisLogRowIdx[axis] = 0;
-	}
-	return ok;
-}
-#define StartAbsMoveWithProfile(axis, target, v,a,d) StartAbsMoveWithProfile_LogTrack(axis, target, v,a,d)
-
-// Torque를 간이 부하율[%]로 환산(예시)
-int TorqueToLoadPercent(int torqueActual)
-{
-	double pct = (double)torqueActual / 100.0;
-	if (pct > 100.0) pct = 100.0;
-	if (pct < -100.0) pct = -100.0;
-	return (int)std::lround(pct);
-}
-
-// Log 클래스로 파일에 1줄 푸시 (same order + barcode)
-void PushOneRecordToFile(const LogRow& r)
-{
-	if (!g_wmxLogReady) return;
-
-	auto ws2utf8 = [](const std::wstring& ws) {
-		if (ws.empty()) return std::string();
-		int sz = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, nullptr, 0, nullptr, nullptr);
-		if (sz <= 1) return std::string();
-		std::string out; out.resize(sz - 1);
-		WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, out.data(), sz, nullptr, nullptr);
-		return out;
-		};
-	std::string sCmd = ws2utf8(FormatTickToTimestamp(r.cmdTick));
-	std::string sDone = ws2utf8(r.doneTick ? FormatTickToTimestamp(r.doneTick) : L"-");
-
-	char line[1024];
-	_snprintf_s(line, _TRUNCATE,
-		"%d,%lld,%lld,%d,%d,%d,%d,%d,%d,%lld,%d,%lu,\"%s\",\"%s\"\r\n",
-		r.axis, r.cmdPos, r.actPos, r.vel, r.acc, r.dec,
-		r.actualCurrent, r.torqueActual, r.loadPercent,
-		r.target6063, r.now6063,
-		r.doneCount, sCmd.c_str(), sDone.c_str());
-
-	g_log.SetCustomLog(kLogCh, /*moduleId*/1, (void*)line, (unsigned int)strlen(line), LogType::Log);
-}
-
-// Detect, sample and log with per-axis enable/disable
-void DetectAndLog()
-{
-	if (!g_commStarted) return;
-
-	g_cm.GetStatus(&g_status);
-
-	// 미리 현재 barcode(now6063) 확보(축0 기준)
-	int now6063_axis0 = 0;
-	ReadAxis0_TxPDO_6063(now6063_axis0);
-
-	for (int a = 0; a < 4; ++a) {
-		// current instant data
-		int cur = 0, trq = 0;
-		//ReadAxis_TxPDO_2181_ActualCurrent(kAxisSlaveId[a], cur);
-		//ReadAxis_TxPDO_6077_TorqueActual(kAxisSlaveId[a], trq);
-		long long actPos = (long long)g_status.axesStatus[a].actualPos;
-		long long cmdPos = (long long)g_status.axesStatus[a].posCmd;
-
-		AxisCommandInfo& ci = g_axisCmdInfo[a];
-
-		// CHANGED: Only push samples while enabled for this axis
-		if (g_axisLogEnabled[a].load()) {
-			LogRow row{};
-			row.axis = a;
-			row.cmdPos = cmdPos;
-			row.actPos = actPos;
-			row.vel = ci.vel;
-			row.acc = ci.acc;
-			row.dec = ci.dec;
-			row.actualCurrent = cur;
-			row.torqueActual = trq;
-			row.loadPercent = TorqueToLoadPercent(trq);
-			row.cmdTick = ci.startTick;
-			row.doneTick = 0;
-			row.doneCount = g_cmdDoneCount[a].load();
-
-			// CHANGED: barcode fields
-			// target6063: 축0에 한해 현재 실행 중인 명령 target을 barcode 기준 타겟으로 간주
-			// (축0이 아닐 경우 - 또는 의미 없을 경우 - 0 세팅)
-			if (a == 0) {
-				row.target6063 = ci.target.load(); // target 명령을 barcode 목표로 사용
-				row.now6063 = now6063_axis0;       // 현재 barcode
-			}
-			else {
-				row.target6063 = 0;
-				row.now6063 = now6063_axis0; // 참고용으로 동일 표기
-			}
-
-			EnterCriticalSection(&g_logCs);
-			g_logBuffer.push_back(row);
-			LeaveCriticalSection(&g_logCs);
-
-			PushOneRecordToFile(row);
-
-			g_axisLogRowIdx[a]++; // not used yet, but kept for extension
-		}
-
-		// done detection
-		if (ci.active.load()) {
-			long long tgt = ci.target.load();
-			int actVel = (int)std::lround((double)g_status.axesStatus[a].actualVelocity);
-			if (std::llabs(actPos - tgt) <= inpos_tol_counts && std::abs(actVel) <= vel_idle_threshold) {
-				ci.active = false;
-				ci.endTick = GetTickCount64();
-				unsigned long cnt = ++g_cmdDoneCount[a];
-
-				// final done record
-				LogRow doneR{};
-				doneR.axis = a;
-				doneR.cmdPos = (long long)g_status.axesStatus[a].posCmd;
-				doneR.actPos = actPos;
-				doneR.vel = ci.vel;
-				doneR.acc = ci.acc;
-				doneR.dec = ci.dec;
-				//ReadAxis_TxPDO_2181_ActualCurrent(kAxisSlaveId[a], doneR.actualCurrent);
-				//ReadAxis_TxPDO_6077_TorqueActual(kAxisSlaveId[a], doneR.torqueActual);
-				doneR.loadPercent = TorqueToLoadPercent(doneR.torqueActual);
-				doneR.cmdTick = ci.startTick;
-				doneR.doneTick = ci.endTick;
-				doneR.doneCount = cnt;
-
-				// barcode fields at done
-				int now6063_done = 0;
-				ReadAxis0_TxPDO_6063(now6063_done);
-				if (a == 0) {
-					doneR.target6063 = ci.target.load();
-					doneR.now6063 = now6063_done;
-				}
-				else {
-					doneR.target6063 = 0;
-					doneR.now6063 = now6063_done;
-				}
-
-				EnterCriticalSection(&g_logCs);
-				g_logBuffer.push_back(doneR);
-				LeaveCriticalSection(&g_logCs);
-
-				PushOneRecordToFile(doneR);
-
-				// CHANGED: Disable further sampling for this axis until new command starts
-				g_axisLogEnabled[a] = false;
-			}
-		}
-	}
-}
-
-HWND g_hLogWnd = nullptr;
-enum : int {
-	ID_LOG_LIST = 20001,
-	ID_LOG_BTN_SAVE = 20002,
-	ID_LOG_TIMER = 20003
-};
-
-std::atomic<bool> g_logThreadRun{ false };
-std::thread g_logThread;
-
-void LogThreadProc() {
-	EnsureLogsFolder();
-	while (g_logThreadRun.load()) {
-		if (g_commStarted) {
-			if (!g_wmxLogReady) StartDataLogFile();
-			DetectAndLog();
-		}
-		else {
-			if (g_wmxLogReady) StopDataLogFile();
-		}
-		Sleep(LOG_POLL_MS);
-	}
-	StopDataLogFile();
-}
-
-void LogWnd_EnsureColumns(HWND hList) {
-	if (ListView_GetColumnWidth(hList, 0) > 0) return;
-	LVCOLUMN col{};
-	col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
-	int c = 0;
-	auto addCol = [&](const wchar_t* name, int w) {
-		col.pszText = const_cast<LPWSTR>(name);
-		col.cx = w; col.iSubItem = c;
-		ListView_InsertColumn(hList, c, &col);
-		++c;
-		};
-
-	// CHANGED: order matches CSV (+ Target6063, Now6063)
-	addCol(L"Axis", 50);
-	addCol(L"CmdPos", 110);
-	addCol(L"ActPos", 110);
-	addCol(L"CmdVel", 80);
-	addCol(L"CmdAcc", 90);
-	addCol(L"CmdDec", 90);
-	addCol(L"Actual Current", 120);
-	addCol(L"Actual Torque", 120);
-	addCol(L"Load[%]", 80);
-	addCol(L"Target6063", 120);
-	addCol(L"Now6063", 100);
-	addCol(L"Done#", 70);
-	addCol(L"Cmd Time", 170);
-	addCol(L"Done Time", 170);
-}
-
-// 자동 스크롤 제어: 맨 아래를 보고 있을 때만 자동 스크롤 유지
-static bool IsListViewScrolledToBottom(HWND hList) {
-	int top = ListView_GetTopIndex(hList);
-	int perPage = ListView_GetCountPerPage(hList);
-	int count = ListView_GetItemCount(hList);
-	if (perPage <= 0 || count <= 0) return true;
-	// top + perPage 가 count 이상이면 거의 바닥
-	return (top + perPage) >= count - 1;
-}
-
-void LogWnd_AppendRows(HWND hList) {
-	static size_t shown = 0;
-
-	// 현재 자동 스크롤 가능한지 체크
-	bool autoScroll = IsListViewScrolledToBottom(hList);
-
-	// 스냅샷으로 안전하게 복사
-	std::vector<LogRow> snap;
-	EnterCriticalSection(&g_logCs);
-	if (shown < g_logBuffer.size()) {
-		snap.insert(snap.end(), g_logBuffer.begin() + shown, g_logBuffer.end());
-		shown = g_logBuffer.size();
-	}
-	LeaveCriticalSection(&g_logCs);
-
-	if (snap.empty()) return;
-
-	int baseIndex = ListView_GetItemCount(hList);
-	int idxInsert = baseIndex;
-
-	for (const LogRow& r : snap) {
-		wchar_t buf[128];
-		LVITEM it{};
-		it.mask = LVIF_TEXT; it.iItem = idxInsert; it.iSubItem = 0;
-		_snwprintf_s(buf, _TRUNCATE, L"%d", r.axis);
-		it.pszText = buf;
-		int idx = ListView_InsertItem(hList, &it);
-
-		_snwprintf_s(buf, _TRUNCATE, L"%lld", r.cmdPos);
-		ListView_SetItemText(hList, idx, 1, buf);
-
-		_snwprintf_s(buf, _TRUNCATE, L"%lld", r.actPos);
-		ListView_SetItemText(hList, idx, 2, buf);
-
-		_snwprintf_s(buf, _TRUNCATE, L"%d", r.vel);
-		ListView_SetItemText(hList, idx, 3, buf);
-
-		_snwprintf_s(buf, _TRUNCATE, L"%d", r.acc);
-		ListView_SetItemText(hList, idx, 4, buf);
-
-		_snwprintf_s(buf, _TRUNCATE, L"%d", r.dec);
-		ListView_SetItemText(hList, idx, 5, buf);
-
-		_snwprintf_s(buf, _TRUNCATE, L"%d", r.actualCurrent);
-		ListView_SetItemText(hList, idx, 6, buf);
-
-		_snwprintf_s(buf, _TRUNCATE, L"%d", r.torqueActual);
-		ListView_SetItemText(hList, idx, 7, buf);
-
-		_snwprintf_s(buf, _TRUNCATE, L"%d", r.loadPercent);
-		ListView_SetItemText(hList, idx, 8, buf);
-
-		_snwprintf_s(buf, _TRUNCATE, L"%lld", r.target6063);
-		ListView_SetItemText(hList, idx, 9, buf);
-
-		_snwprintf_s(buf, _TRUNCATE, L"%d", r.now6063);
-		ListView_SetItemText(hList, idx, 10, buf);
-
-		_snwprintf_s(buf, _TRUNCATE, L"%lu", r.doneCount);
-		ListView_SetItemText(hList, idx, 11, buf);
-
-		std::wstring cmdTS = FormatTickToTimestamp(r.cmdTick);
-		std::wstring doneTS = (r.doneTick != 0) ? FormatTickToTimestamp(r.doneTick) : L"-";
-		ListView_SetItemText(hList, idx, 12, const_cast<LPWSTR>(cmdTS.c_str()));
-		ListView_SetItemText(hList, idx, 13, const_cast<LPWSTR>(doneTS.c_str()));
-
-		idxInsert++;
-	}
-
-	// 자동 스크롤 상태일 때만 맨 마지막 행 보이기
-	if (autoScroll) {
-		int cnt = (int)SendMessage(hList, LVM_GETITEMCOUNT, 0, 0);
-		if (cnt > 0) SendMessage(hList, LVM_ENSUREVISIBLE, cnt - 1, FALSE);
-	}
-}
-
-LRESULT CALLBACK LogWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-	static HWND hList = nullptr;
-	switch (msg) {
-	case WM_CREATE:
-	{
-		CreateWindow(TEXT("BUTTON"), TEXT("Motion Log"), WS_CHILD | WS_VISIBLE | BS_GROUPBOX, 10, 10, 1500, 610, hWnd, 0, 0, 0);
-		hList = CreateWindow(WC_LISTVIEW, TEXT(""), WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SINGLESEL,
-			20, 40, 960, 500, hWnd, (HMENU)ID_LOG_LIST, 0, 0);
-		ListView_SetExtendedListViewStyle(hList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
-		LogWnd_EnsureColumns(hList);
-		CreateWindow(TEXT("BUTTON"), TEXT("Save CSV..."), WS_CHILD | WS_VISIBLE, 20, 550, 120, 28, hWnd, (HMENU)ID_LOG_BTN_SAVE, 0, 0);
-		SetTimer(hWnd, ID_LOG_TIMER, LOG_POLL_MS, nullptr);
-		return 0;
-	}
-	case WM_SIZE:
-	{
-		RECT rc{}; GetClientRect(hWnd, &rc);
-		if (hList) SetWindowPos(hList, nullptr, 20, 40, rc.right - 40, rc.bottom - 80, SWP_NOZORDER);
-		return 0;
-	}
-	case WM_TIMER:
-		if (wParam == ID_LOG_TIMER) {
-			if (hList) LogWnd_AppendRows(hList);
-			return 0;
-		}
-		break;
-	case WM_COMMAND:
-		if (LOWORD(wParam) == ID_LOG_BTN_SAVE) {
-			EnsureLogsFolder();
-			wchar_t file[MAX_PATH] = L"logs\\motion_log.csv";
-			if (SaveLogCSV(file))
-				MessageBox(hWnd, L"Saved: logs\\motion_log.csv", L"Log", MB_ICONINFORMATION);
-			else
-				MessageBox(hWnd, L"Save failed. Check folder permission or path.", L"Log", MB_ICONERROR);
-			return 0;
-		}
-		break;
-	case WM_CLOSE:
-		DestroyWindow(hWnd);
-		return 0;
-	case WM_DESTROY:
-		g_hLogWnd = nullptr;
-		return 0;
-	}
-	return DefWindowProc(hWnd, msg, wParam, lParam);
-}
-
-// Scope 창(간이 뷰어, 추후 그래프 구현 자리)
-HWND g_hScopeWnd = nullptr;
-LRESULT CALLBACK ScopeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-	switch (msg) {
-	case WM_CREATE:
-		CreateWindow(TEXT("STATIC"), TEXT("Scope (향후 CSV로 그래프 구현)"), WS_CHILD | WS_VISIBLE, 20, 20, 260, 24, hWnd, 0, 0, 0);
-		return 0;
-	case WM_CLOSE:
-		DestroyWindow(hWnd);
-		return 0;
-	case WM_DESTROY:
-		g_hScopeWnd = nullptr;
-		return 0;
-	}
-	return DefWindowProc(hWnd, msg, wParam, lParam);
-}
-
-// 창 표시 헬퍼
-void ShowLogWindow(HWND parent) {
-	if (!g_hLogWnd || !IsWindow(g_hLogWnd)) {
-		WNDCLASS wc{}; wc.lpszClassName = TEXT("WMX3LogWnd");
-		wc.lpfnWndProc = LogWndProc; wc.hInstance = (HINSTANCE)GetWindowLongPtr(parent, GWLP_HINSTANCE);
-		wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-		wc.hbrBackground = (HBRUSH)(COLOR_3DFACE + 1);
-		RegisterClass(&wc);
-		g_hLogWnd = CreateWindow(TEXT("WMX3LogWnd"), TEXT("Motion Log"),
-			WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_SIZEBOX | WS_MINIMIZEBOX,
-			CW_USEDEFAULT, CW_USEDEFAULT, 1537, 680, parent, nullptr, wc.hInstance, nullptr);
-		ShowWindow(g_hLogWnd, SW_SHOWNORMAL);
-	}
-	else {
-		ShowWindow(g_hLogWnd, SW_SHOWNORMAL);
-		SetForegroundWindow(g_hLogWnd);
-	}
-}
-
-void ShowScopeWindow(HWND parent) {
-	if (!g_hScopeWnd || !IsWindow(g_hScopeWnd)) {
-		WNDCLASS wc{}; wc.lpszClassName = TEXT("WMX3ScopeWnd");
-		wc.lpfnWndProc = ScopeWndProc; wc.hInstance = (HINSTANCE)GetWindowLongPtr(parent, GWLP_HINSTANCE);
-		wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-		wc.hbrBackground = (HBRUSH)(COLOR_3DFACE + 1);
-		RegisterClass(&wc);
-		g_hScopeWnd = CreateWindow(TEXT("WMX3ScopeWnd"), TEXT("Scope (Graph Viewer)"),
-			WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_SIZEBOX | WS_MINIMIZEBOX,
-			CW_USEDEFAULT, CW_USEDEFAULT, 800, 480, parent, nullptr, wc.hInstance, nullptr);
-		ShowWindow(g_hScopeWnd, SW_SHOWNORMAL);
-	}
-	else {
-		ShowWindow(g_hScopeWnd, SW_SHOWNORMAL);
-		SetForegroundWindow(g_hScopeWnd);
-	}
-}
+//// ------------------ (BEGIN) LOG/SCOPE BLOCK: integrated ------------------
+//// WMX3 파일 로그 채널 설정
+//const unsigned int kLogCh = 0; // 채널 0 사용
+//bool g_wmxLogReady = false;
+//
+//// 로그 폴더 보장
+//void EnsureLogsFolder() {
+//	EnsureDirW(L"logs");
+//}
+//
+//// CHANGED: Unified column order and header text (+ Target6063, Now6063)
+//static const char* kCsvHeaders[] = {
+//	"Axis","CmdPos","ActPos","CmdVel","CmdAcc","CmdDec",
+//	"ActualCurrent","ActualTorque","LoadPercent",
+//	"Target6063","Now6063",
+//	"Done#","CmdTime","DoneTime"
+//};
+//
+//// Log 클래스로 파일 로그 시작/옵션 설정
+//void StartDataLogFile()
+//{
+//	if (!g_commStarted) return;
+//
+//	const wchar_t* dir = L"C:\\wmx3_logfile";
+//	EnsureDirW(dir);
+//
+//	LogFilePathW pathW{};
+//	wcsncpy_s(pathW.dirPath, dir, _TRUNCATE);
+//	wcsncpy_s(pathW.fileName, L"motion.csv", _TRUNCATE);
+//
+//	LogChannelOptions opt{};
+//	opt.maxLogFileSize = 4 * 1024 * 1024; // 4MB
+//	opt.maxLogFileCount = 10;
+//	opt.isRotateFile = true;
+//	opt.stopLoggingOnBufferOverflow = false;
+//	opt.samplingTimeMilliseconds = 0;
+//	opt.samplingPeriodInCycles = 0;
+//	opt.precision = 6;
+//	opt.isDelimInLastCol = false;
+//	strcpy_s(opt.delimiter, ",");
+//	opt.triggerOnCondition = 0;
+//	opt.triggerOnEvent = 0;
+//	opt.triggerEventID = 0;
+//
+//	g_log.ResetLog(kLogCh);
+//	g_log.SetLogOption(kLogCh, &opt);
+//	g_log.SetLogFilePath(kLogCh, &pathW);
+//	g_log.SetLogHeader(kLogCh, (char**)kCsvHeaders, (unsigned)std::size(kCsvHeaders));
+//	g_log.StartLog(kLogCh);
+//
+//	g_wmxLogReady = true;
+//}
+//
+//// 파일 로그 중지
+//void StopDataLogFile()
+//{
+//	if (!g_wmxLogReady) return;
+//	g_log.StopLog(kLogCh);
+//	g_wmxLogReady = false;
+//}
+//
+//// 로컬 메모리 로그(리스트뷰 표시용)
+//struct LogRow {
+//	int axis;
+//	long long cmdPos;
+//	long long actPos;
+//	int vel;
+//	int acc;
+//	int dec;
+//	int actualCurrent;
+//	int torqueActual;
+//	int loadPercent;
+//
+//	// CHANGED: add barcode fields
+//	long long target6063; // target barcode (intended position in 0x6063 domain)
+//	int now6063;          // current barcode read from 0x6063
+//
+//	unsigned long doneCount;
+//	ULONGLONG cmdTick;
+//	ULONGLONG doneTick;
+//};
+//CRITICAL_SECTION g_logCs;
+//std::vector<LogRow> g_logBuffer;
+//
+//// CSV 저장 helpers
+//std::wstring FormatTickToTimestamp(ULONGLONG /*tick*/) {
+//	// tick 값은 상대시간이므로 사용자 가독성을 위해 저장 시점의 로컬 시간 사용
+//	SYSTEMTIME st{};
+//	GetLocalTime(&st);
+//	wchar_t buf[64];
+//	swprintf_s(buf, L"%04d.%02d.%02d_%02d:%02d:%02d.%03d",
+//		st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+//	return buf;
+//}
+//
+//// CHANGED: 스냅샷 기반 CSV 저장, 동시성 안전 (+ barcode columns)
+//bool SaveLogCSV(const wchar_t* path) {
+//	// 폴더 보장
+//	wchar_t dir[MAX_PATH]{};
+//	wcsncpy_s(dir, path, _TRUNCATE);
+//	PathRemoveFileSpecW(dir);
+//	if (dir[0]) {
+//		EnsureDirW(dir);
+//	}
+//	else {
+//		EnsureLogsFolder();
+//	}
+//
+//	// 스냅샷 생성
+//	std::vector<LogRow> snap;
+//	EnterCriticalSection(&g_logCs);
+//	snap = g_logBuffer;
+//	LeaveCriticalSection(&g_logCs);
+//
+//	std::ofstream f(path, std::ios::binary | std::ios::trunc);
+//	if (!f.is_open()) {
+//		return false;
+//	}
+//
+//	// UTF-8 BOM
+//	const unsigned char bom[3] = { 0xEF,0xBB,0xBF };
+//	f.write((const char*)bom, 3);
+//
+//	auto ws2utf8 = [](const std::wstring& ws) {
+//		if (ws.empty()) return std::string();
+//		int sz = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, nullptr, 0, nullptr, nullptr);
+//		if (sz <= 1) return std::string();
+//		std::string out; out.resize(sz - 1);
+//		WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, out.data(), sz, nullptr, nullptr);
+//		return out;
+//		};
+//
+//	auto writeQuoted = [&](const std::string& s) {
+//		f.put('"');
+//		for (char c : s) {
+//			if (c == '"') f.put('"');
+//			f.put(c);
+//		}
+//		f.put('"');
+//		};
+//
+//	// header
+//	for (size_t i = 0; i < std::size(kCsvHeaders); ++i) {
+//		if (i) f << ",";
+//		f << kCsvHeaders[i];
+//	}
+//	f << "\r\n";
+//
+//	// rows
+//	for (const auto& r : snap) {
+//		std::string sCmd = ws2utf8(FormatTickToTimestamp(r.cmdTick));
+//		std::string sDone = ws2utf8(r.doneTick ? FormatTickToTimestamp(r.doneTick) : L"-");
+//
+//		f << r.axis << ","
+//			<< r.cmdPos << ","
+//			<< r.actPos << ","
+//			<< r.vel << ","
+//			<< r.acc << ","
+//			<< r.dec << ","
+//			<< r.actualCurrent << ","
+//			<< r.torqueActual << ","
+//			<< r.loadPercent << ","
+//			<< r.target6063 << ","
+//			<< r.now6063 << ","
+//			<< r.doneCount << ",";
+//		writeQuoted(sCmd);
+//		f << ",";
+//		writeQuoted(sDone);
+//		f << "\r\n";
+//	}
+//
+//	f.close();
+//	return true;
+//}
+//
+//// 명령 시작시 기록 도우미
+//bool StartAbsMoveWithProfile_LogTrack(int axis, long long target, double vpps, double tAcc, double tDec) {
+//	bool ok = StartAbsMoveWithProfile(axis, target, vpps, tAcc, tDec);
+//	if (ok) {
+//		g_axisCmdInfo[axis].axis = axis;
+//		g_axisCmdInfo[axis].target = target;
+//		g_axisCmdInfo[axis].vel = (int)std::lround(vpps);
+//		g_axisCmdInfo[axis].acc = TimeMsToAcc(vpps, tAcc);
+//		g_axisCmdInfo[axis].dec = TimeMsToAcc(vpps, tDec);
+//		g_axisCmdInfo[axis].startTick = GetTickCount64();
+//		g_axisCmdInfo[axis].active = true;
+//		g_axisCmdInfo[axis].endTick = 0;
+//
+//		// CHANGED: resume logging
+//		g_axisLogEnabled[axis] = true;
+//		g_axisLogRowIdx[axis] = 0;
+//	}
+//	return ok;
+//}
+//#define StartAbsMoveWithProfile(axis, target, v,a,d) StartAbsMoveWithProfile_LogTrack(axis, target, v,a,d)
+//
+//// Torque를 간이 부하율[%]로 환산(예시)
+//int TorqueToLoadPercent(int torqueActual)
+//{
+//	double pct = (double)torqueActual / 100.0;
+//	if (pct > 100.0) pct = 100.0;
+//	if (pct < -100.0) pct = -100.0;
+//	return (int)std::lround(pct);
+//}
+//
+//// Log 클래스로 파일에 1줄 푸시 (same order + barcode)
+//void PushOneRecordToFile(const LogRow& r)
+//{
+//	if (!g_wmxLogReady) return;
+//
+//	auto ws2utf8 = [](const std::wstring& ws) {
+//		if (ws.empty()) return std::string();
+//		int sz = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, nullptr, 0, nullptr, nullptr);
+//		if (sz <= 1) return std::string();
+//		std::string out; out.resize(sz - 1);
+//		WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, out.data(), sz, nullptr, nullptr);
+//		return out;
+//		};
+//	std::string sCmd = ws2utf8(FormatTickToTimestamp(r.cmdTick));
+//	std::string sDone = ws2utf8(r.doneTick ? FormatTickToTimestamp(r.doneTick) : L"-");
+//
+//	char line[1024];
+//	_snprintf_s(line, _TRUNCATE,
+//		"%d,%lld,%lld,%d,%d,%d,%d,%d,%d,%lld,%d,%lu,\"%s\",\"%s\"\r\n",
+//		r.axis, r.cmdPos, r.actPos, r.vel, r.acc, r.dec,
+//		r.actualCurrent, r.torqueActual, r.loadPercent,
+//		r.target6063, r.now6063,
+//		r.doneCount, sCmd.c_str(), sDone.c_str());
+//
+//	g_log.SetCustomLog(kLogCh, /*moduleId*/1, (void*)line, (unsigned int)strlen(line), LogType::Log);
+//}
+
+//// Detect, sample and log with per-axis enable/disable
+//void DetectAndLog()
+//{
+//	if (!g_commStarted) return;
+//
+//	g_cm.GetStatus(&g_status);
+//
+//	// 미리 현재 barcode(now6063) 확보(축0 기준)
+//	int now6063_axis0 = 0;
+//	ReadAxis0_TxPDO_6063(now6063_axis0);
+//
+//	for (int a = 0; a < 4; ++a) {
+//		// current instant data
+//		int cur = 0, trq = 0;
+//		//ReadAxis_TxPDO_2181_ActualCurrent(kAxisSlaveId[a], cur);
+//		//ReadAxis_TxPDO_6077_TorqueActual(kAxisSlaveId[a], trq);
+//		long long actPos = (long long)g_status.axesStatus[a].actualPos;
+//		long long cmdPos = (long long)g_status.axesStatus[a].posCmd;
+//
+//		AxisCommandInfo& ci = g_axisCmdInfo[a];
+//
+//		// CHANGED: Only push samples while enabled for this axis
+//		if (g_axisLogEnabled[a].load()) {
+//			LogRow row{};
+//			row.axis = a;
+//			row.cmdPos = cmdPos;
+//			row.actPos = actPos;
+//			row.vel = ci.vel;
+//			row.acc = ci.acc;
+//			row.dec = ci.dec;
+//			row.actualCurrent = cur;
+//			row.torqueActual = trq;
+//			row.loadPercent = TorqueToLoadPercent(trq);
+//			row.cmdTick = ci.startTick;
+//			row.doneTick = 0;
+//			row.doneCount = g_cmdDoneCount[a].load();
+//
+//			// CHANGED: barcode fields
+//			// target6063: 축0에 한해 현재 실행 중인 명령 target을 barcode 기준 타겟으로 간주
+//			// (축0이 아닐 경우 - 또는 의미 없을 경우 - 0 세팅)
+//			if (a == 0) {
+//				row.target6063 = ci.target.load(); // target 명령을 barcode 목표로 사용
+//				row.now6063 = now6063_axis0;       // 현재 barcode
+//			}
+//			else {
+//				row.target6063 = 0;
+//				row.now6063 = now6063_axis0; // 참고용으로 동일 표기
+//			}
+//
+//			EnterCriticalSection(&g_logCs);
+//			g_logBuffer.push_back(row);
+//			LeaveCriticalSection(&g_logCs);
+//
+//			PushOneRecordToFile(row);
+//
+//			g_axisLogRowIdx[a]++; // not used yet, but kept for extension
+//		}
+//
+//		// done detection
+//		if (ci.active.load()) {
+//			long long tgt = ci.target.load();
+//			int actVel = (int)std::lround((double)g_status.axesStatus[a].actualVelocity);
+//			if (std::llabs(actPos - tgt) <= inpos_tol_counts && std::abs(actVel) <= vel_idle_threshold) {
+//				ci.active = false;
+//				ci.endTick = GetTickCount64();
+//				unsigned long cnt = ++g_cmdDoneCount[a];
+//
+//				// final done record
+//				LogRow doneR{};
+//				doneR.axis = a;
+//				doneR.cmdPos = (long long)g_status.axesStatus[a].posCmd;
+//				doneR.actPos = actPos;
+//				doneR.vel = ci.vel;
+//				doneR.acc = ci.acc;
+//				doneR.dec = ci.dec;
+//				//ReadAxis_TxPDO_2181_ActualCurrent(kAxisSlaveId[a], doneR.actualCurrent);
+//				//ReadAxis_TxPDO_6077_TorqueActual(kAxisSlaveId[a], doneR.torqueActual);
+//				doneR.loadPercent = TorqueToLoadPercent(doneR.torqueActual);
+//				doneR.cmdTick = ci.startTick;
+//				doneR.doneTick = ci.endTick;
+//				doneR.doneCount = cnt;
+//
+//				// barcode fields at done
+//				int now6063_done = 0;
+//				ReadAxis0_TxPDO_6063(now6063_done);
+//				if (a == 0) {
+//					doneR.target6063 = ci.target.load();
+//					doneR.now6063 = now6063_done;
+//				}
+//				else {
+//					doneR.target6063 = 0;
+//					doneR.now6063 = now6063_done;
+//				}
+//
+//				EnterCriticalSection(&g_logCs);
+//				g_logBuffer.push_back(doneR);
+//				LeaveCriticalSection(&g_logCs);
+//
+//				PushOneRecordToFile(doneR);
+//
+//				// CHANGED: Disable further sampling for this axis until new command starts
+//				g_axisLogEnabled[a] = false;
+//			}
+//		}
+//	}
+//}
+//
+//HWND g_hLogWnd = nullptr;
+//enum : int {
+//	ID_LOG_LIST = 20001,
+//	ID_LOG_BTN_SAVE = 20002,
+//	ID_LOG_TIMER = 20003
+//};
+//
+//std::atomic<bool> g_logThreadRun{ false };
+//std::thread g_logThread;
+//
+//void LogThreadProc() {
+//	EnsureLogsFolder();
+//	while (g_logThreadRun.load()) {
+//		if (g_commStarted) {
+//			if (!g_wmxLogReady) StartDataLogFile();
+//			DetectAndLog();
+//		}
+//		else {
+//			if (g_wmxLogReady) StopDataLogFile();
+//		}
+//		Sleep(LOG_POLL_MS);
+//	}
+//	StopDataLogFile();
+//}
+//
+//void LogWnd_EnsureColumns(HWND hList) {
+//	if (ListView_GetColumnWidth(hList, 0) > 0) return;
+//	LVCOLUMN col{};
+//	col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+//	int c = 0;
+//	auto addCol = [&](const wchar_t* name, int w) {
+//		col.pszText = const_cast<LPWSTR>(name);
+//		col.cx = w; col.iSubItem = c;
+//		ListView_InsertColumn(hList, c, &col);
+//		++c;
+//		};
+//
+//	// CHANGED: order matches CSV (+ Target6063, Now6063)
+//	addCol(L"Axis", 50);
+//	addCol(L"CmdPos", 110);
+//	addCol(L"ActPos", 110);
+//	addCol(L"CmdVel", 80);
+//	addCol(L"CmdAcc", 90);
+//	addCol(L"CmdDec", 90);
+//	addCol(L"Actual Current", 120);
+//	addCol(L"Actual Torque", 120);
+//	addCol(L"Load[%]", 80);
+//	addCol(L"Target6063", 120);
+//	addCol(L"Now6063", 100);
+//	addCol(L"Done#", 70);
+//	addCol(L"Cmd Time", 170);
+//	addCol(L"Done Time", 170);
+//}
+//
+//// 자동 스크롤 제어: 맨 아래를 보고 있을 때만 자동 스크롤 유지
+//static bool IsListViewScrolledToBottom(HWND hList) {
+//	int top = ListView_GetTopIndex(hList);
+//	int perPage = ListView_GetCountPerPage(hList);
+//	int count = ListView_GetItemCount(hList);
+//	if (perPage <= 0 || count <= 0) return true;
+//	// top + perPage 가 count 이상이면 거의 바닥
+//	return (top + perPage) >= count - 1;
+//}
+//
+//void LogWnd_AppendRows(HWND hList) {
+//	static size_t shown = 0;
+//
+//	// 현재 자동 스크롤 가능한지 체크
+//	bool autoScroll = IsListViewScrolledToBottom(hList);
+//
+//	// 스냅샷으로 안전하게 복사
+//	std::vector<LogRow> snap;
+//	EnterCriticalSection(&g_logCs);
+//	if (shown < g_logBuffer.size()) {
+//		snap.insert(snap.end(), g_logBuffer.begin() + shown, g_logBuffer.end());
+//		shown = g_logBuffer.size();
+//	}
+//	LeaveCriticalSection(&g_logCs);
+//
+//	if (snap.empty()) return;
+//
+//	int baseIndex = ListView_GetItemCount(hList);
+//	int idxInsert = baseIndex;
+//
+//	for (const LogRow& r : snap) {
+//		wchar_t buf[128];
+//		LVITEM it{};
+//		it.mask = LVIF_TEXT; it.iItem = idxInsert; it.iSubItem = 0;
+//		_snwprintf_s(buf, _TRUNCATE, L"%d", r.axis);
+//		it.pszText = buf;
+//		int idx = ListView_InsertItem(hList, &it);
+//
+//		_snwprintf_s(buf, _TRUNCATE, L"%lld", r.cmdPos);
+//		ListView_SetItemText(hList, idx, 1, buf);
+//
+//		_snwprintf_s(buf, _TRUNCATE, L"%lld", r.actPos);
+//		ListView_SetItemText(hList, idx, 2, buf);
+//
+//		_snwprintf_s(buf, _TRUNCATE, L"%d", r.vel);
+//		ListView_SetItemText(hList, idx, 3, buf);
+//
+//		_snwprintf_s(buf, _TRUNCATE, L"%d", r.acc);
+//		ListView_SetItemText(hList, idx, 4, buf);
+//
+//		_snwprintf_s(buf, _TRUNCATE, L"%d", r.dec);
+//		ListView_SetItemText(hList, idx, 5, buf);
+//
+//		_snwprintf_s(buf, _TRUNCATE, L"%d", r.actualCurrent);
+//		ListView_SetItemText(hList, idx, 6, buf);
+//
+//		_snwprintf_s(buf, _TRUNCATE, L"%d", r.torqueActual);
+//		ListView_SetItemText(hList, idx, 7, buf);
+//
+//		_snwprintf_s(buf, _TRUNCATE, L"%d", r.loadPercent);
+//		ListView_SetItemText(hList, idx, 8, buf);
+//
+//		_snwprintf_s(buf, _TRUNCATE, L"%lld", r.target6063);
+//		ListView_SetItemText(hList, idx, 9, buf);
+//
+//		_snwprintf_s(buf, _TRUNCATE, L"%d", r.now6063);
+//		ListView_SetItemText(hList, idx, 10, buf);
+//
+//		_snwprintf_s(buf, _TRUNCATE, L"%lu", r.doneCount);
+//		ListView_SetItemText(hList, idx, 11, buf);
+//
+//		std::wstring cmdTS = FormatTickToTimestamp(r.cmdTick);
+//		std::wstring doneTS = (r.doneTick != 0) ? FormatTickToTimestamp(r.doneTick) : L"-";
+//		ListView_SetItemText(hList, idx, 12, const_cast<LPWSTR>(cmdTS.c_str()));
+//		ListView_SetItemText(hList, idx, 13, const_cast<LPWSTR>(doneTS.c_str()));
+//
+//		idxInsert++;
+//	}
+//
+//	// 자동 스크롤 상태일 때만 맨 마지막 행 보이기
+//	if (autoScroll) {
+//		int cnt = (int)SendMessage(hList, LVM_GETITEMCOUNT, 0, 0);
+//		if (cnt > 0) SendMessage(hList, LVM_ENSUREVISIBLE, cnt - 1, FALSE);
+//	}
+//}
+//
+//LRESULT CALLBACK LogWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+//	static HWND hList = nullptr;
+//	switch (msg) {
+//	case WM_CREATE:
+//	{
+//		CreateWindow(TEXT("BUTTON"), TEXT("Motion Log"), WS_CHILD | WS_VISIBLE | BS_GROUPBOX, 10, 10, 1500, 610, hWnd, 0, 0, 0);
+//		hList = CreateWindow(WC_LISTVIEW, TEXT(""), WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SINGLESEL,
+//			20, 40, 960, 500, hWnd, (HMENU)ID_LOG_LIST, 0, 0);
+//		ListView_SetExtendedListViewStyle(hList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+//		LogWnd_EnsureColumns(hList);
+//		CreateWindow(TEXT("BUTTON"), TEXT("Save CSV..."), WS_CHILD | WS_VISIBLE, 20, 550, 120, 28, hWnd, (HMENU)ID_LOG_BTN_SAVE, 0, 0);
+//		SetTimer(hWnd, ID_LOG_TIMER, LOG_POLL_MS, nullptr);
+//		return 0;
+//	}
+//	case WM_SIZE:
+//	{
+//		RECT rc{}; GetClientRect(hWnd, &rc);
+//		if (hList) SetWindowPos(hList, nullptr, 20, 40, rc.right - 40, rc.bottom - 80, SWP_NOZORDER);
+//		return 0;
+//	}
+//	case WM_TIMER:
+//		if (wParam == ID_LOG_TIMER) {
+//			if (hList) LogWnd_AppendRows(hList);
+//			return 0;
+//		}
+//		break;
+//	case WM_COMMAND:
+//		if (LOWORD(wParam) == ID_LOG_BTN_SAVE) {
+//			EnsureLogsFolder();
+//			wchar_t file[MAX_PATH] = L"logs\\motion_log.csv";
+//			if (SaveLogCSV(file))
+//				MessageBox(hWnd, L"Saved: logs\\motion_log.csv", L"Log", MB_ICONINFORMATION);
+//			else
+//				MessageBox(hWnd, L"Save failed. Check folder permission or path.", L"Log", MB_ICONERROR);
+//			return 0;
+//		}
+//		break;
+//	case WM_CLOSE:
+//		DestroyWindow(hWnd);
+//		return 0;
+//	case WM_DESTROY:
+//		g_hLogWnd = nullptr;
+//		return 0;
+//	}
+//	return DefWindowProc(hWnd, msg, wParam, lParam);
+//}
+//
+//// Scope 창(간이 뷰어, 추후 그래프 구현 자리)
+//HWND g_hScopeWnd = nullptr;
+//LRESULT CALLBACK ScopeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+//	switch (msg) {
+//	case WM_CREATE:
+//		CreateWindow(TEXT("STATIC"), TEXT("Scope (향후 CSV로 그래프 구현)"), WS_CHILD | WS_VISIBLE, 20, 20, 260, 24, hWnd, 0, 0, 0);
+//		return 0;
+//	case WM_CLOSE:
+//		DestroyWindow(hWnd);
+//		return 0;
+//	case WM_DESTROY:
+//		g_hScopeWnd = nullptr;
+//		return 0;
+//	}
+//	return DefWindowProc(hWnd, msg, wParam, lParam);
+//}
+//
+//// 창 표시 헬퍼
+//void ShowLogWindow(HWND parent) {
+//	if (!g_hLogWnd || !IsWindow(g_hLogWnd)) {
+//		WNDCLASS wc{}; wc.lpszClassName = TEXT("WMX3LogWnd");
+//		wc.lpfnWndProc = LogWndProc; wc.hInstance = (HINSTANCE)GetWindowLongPtr(parent, GWLP_HINSTANCE);
+//		wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+//		wc.hbrBackground = (HBRUSH)(COLOR_3DFACE + 1);
+//		RegisterClass(&wc);
+//		g_hLogWnd = CreateWindow(TEXT("WMX3LogWnd"), TEXT("Motion Log"),
+//			WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_SIZEBOX | WS_MINIMIZEBOX,
+//			CW_USEDEFAULT, CW_USEDEFAULT, 1537, 680, parent, nullptr, wc.hInstance, nullptr);
+//		ShowWindow(g_hLogWnd, SW_SHOWNORMAL);
+//	}
+//	else {
+//		ShowWindow(g_hLogWnd, SW_SHOWNORMAL);
+//		SetForegroundWindow(g_hLogWnd);
+//	}
+//}
+//
+//void ShowScopeWindow(HWND parent) {
+//	if (!g_hScopeWnd || !IsWindow(g_hScopeWnd)) {
+//		WNDCLASS wc{}; wc.lpszClassName = TEXT("WMX3ScopeWnd");
+//		wc.lpfnWndProc = ScopeWndProc; wc.hInstance = (HINSTANCE)GetWindowLongPtr(parent, GWLP_HINSTANCE);
+//		wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+//		wc.hbrBackground = (HBRUSH)(COLOR_3DFACE + 1);
+//		RegisterClass(&wc);
+//		g_hScopeWnd = CreateWindow(TEXT("WMX3ScopeWnd"), TEXT("Scope (Graph Viewer)"),
+//			WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_SIZEBOX | WS_MINIMIZEBOX,
+//			CW_USEDEFAULT, CW_USEDEFAULT, 800, 480, parent, nullptr, wc.hInstance, nullptr);
+//		ShowWindow(g_hScopeWnd, SW_SHOWNORMAL);
+//	}
+//	else {
+//		ShowWindow(g_hScopeWnd, SW_SHOWNORMAL);
+//		SetForegroundWindow(g_hScopeWnd);
+//	}
+//}
 // ------------------ (END) LOG/SCOPE BLOCK ------------------
 
 
@@ -6078,11 +6078,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		// TCP 서버는 AutoStart 이후 시작하거나, 필요 시 아래 주석 해제
 		//StartTcpServer();
 
-		// LOG/SCOPE 스레드
-		InitializeCriticalSection(&g_logCs);
-		g_logThreadRun = true;
-		g_logThread = std::thread(LogThreadProc);
-		g_logThread.detach();
+		//// LOG/SCOPE 스레드
+		//InitializeCriticalSection(&g_logCs);
+		//g_logThreadRun = true;
+		//g_logThread = std::thread(LogThreadProc);
+		//g_logThread.detach();
 
 		// Axis2 flags reset
 		g_ax2LimitOn = false;
@@ -6129,42 +6129,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				}
 				DoGripServoOff_Compat(hMain);
 			}
-
-			Sleep(2000);
-
+			std::this_thread::sleep_for(std::chrono::seconds(2));
 			// 4) HasBox 상관없이 위치 정리 로직
-			if (IsAxis2LimitOn()) {
-				AppendLog(L"[AUTO] Axis2 limit ON -> check travel barcode");
-
-				//unsigned char code = CalcPosTravelCode(); // 0x01 = Load(476774), 0x02 = Unload(491332), etc.
-
-				//if (code == 0x01) {
-				//	// 이미 Load 위치(476774) → 주행 안 함
-				//	AppendLog(L"[AUTO] Travel at Load(476774) -> no travel move");
-				//}
-				//else {
-				//	// Limit ON인데 Load 위치가 아니면 Conveyor 위치로 이동
-				//	AppendLog(L"[AUTO] Axis2 limit ON & not at Load -> GO_Conveyor() with DO11");
-
-				//	// 축 동작 시작: DO11 ON
-				//	//ToggleDO_HW(11, true, hMain);
-
-				//	GO_Conveyor();
-				//	bool okConv = WaitTaskFinished(TaskId::GoConveyor, 30000);
-
-				//	AppendLog(okConv
-				//		? L"[AUTO] GO_Conveyor DONE"
-				//		: L"[AUTO][WARN] GO_Conveyor FAILED or TIMEOUT");
-
-				//	if (!okConv) {
-				//		setupOk = false;
-				//	}
-
-					// 동작 종료: DO11 OFF
-					//ToggleDO_HW(11, false, hMain);
-				//}
-			}
-			else {
+			if (!IsAxis2LimitOn()) {
 				AppendLog(L"[AUTO] Axis2 limit OFF -> Move Axis2 to -1000 with DO11");
 
 				// 1) Axis2를 -1000으로 이동 (직접 프로파일 명령 사용)
@@ -6180,7 +6147,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 				bool okAxis2 = false;
 				if (started) {
-					okAxis2 = WaitAllAxesStopped(1.0, 20000);
+					okAxis2 = WaitUntil(IsAxis2LimitOn, 10000);
 				}
 				else {
 					AppendLog(L"[AUTO][WARN] StartAbsMoveWithProfile(axis2) FAILED");
@@ -6219,6 +6186,37 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				//	}
 
 				//	//ToggleDO_HW(11, false, hMain);
+				//}
+			}
+			else {
+				AppendLog(L"[AUTO] Axis2 limit ON -> check travel barcode");
+
+				//unsigned char code = CalcPosTravelCode(); // 0x01 = Load(476774), 0x02 = Unload(491332), etc.
+
+				//if (code == 0x01) {
+				//	// 이미 Load 위치(476774) → 주행 안 함
+				//	AppendLog(L"[AUTO] Travel at Load(476774) -> no travel move");
+				//}
+				//else {
+				//	// Limit ON인데 Load 위치가 아니면 Conveyor 위치로 이동
+				//	AppendLog(L"[AUTO] Axis2 limit ON & not at Load -> GO_Conveyor() with DO11");
+
+				//	// 축 동작 시작: DO11 ON
+				//	//ToggleDO_HW(11, true, hMain);
+
+				//	GO_Conveyor();
+				//	bool okConv = WaitTaskFinished(TaskId::GoConveyor, 30000);
+
+				//	AppendLog(okConv
+				//		? L"[AUTO] GO_Conveyor DONE"
+				//		: L"[AUTO][WARN] GO_Conveyor FAILED or TIMEOUT");
+
+				//	if (!okConv) {
+				//		setupOk = false;
+				//	}
+
+					// 동작 종료: DO11 OFF
+					//ToggleDO_HW(11, false, hMain);
 				//}
 			}
 
@@ -6288,9 +6286,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		if (id == ID_BTN_FASTECH_MANUAL) { ShowErrorManual(hWnd, true); return 0; }
 		if (id == ID_BTN_WELCON_MANUAL) { ShowErrorManual(hWnd, false); return 0; }
 
-		// Log/Scope 버튼
-		if (id == ID_BTN_LOG_WINDOW) { ShowLogWindow(hWnd); return 0; }
-		if (id == ID_BTN_SCOPE_WINDOW) { ShowScopeWindow(hWnd); return 0; }
+		//// Log/Scope 버튼
+		//if (id == ID_BTN_LOG_WINDOW) { ShowLogWindow(hWnd); return 0; }
+		//if (id == ID_BTN_SCOPE_WINDOW) { ShowScopeWindow(hWnd); return 0; }
 
 		if (id == ID_CHECK_AXIS_0 || id == ID_CHECK_AXIS_1 || id == ID_CHECK_AXIS_2 || id == ID_CHECK_AXIS_3) {
 			if (code == BN_CLICKED) UpdateSelectedAxesTextOnDemand(hWnd);
@@ -6667,8 +6665,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		StopTcpServer();
 
 		// LOG/SCOPE: thread stop & CS cleanup
-		g_logThreadRun = false;
-		DeleteCriticalSection(&g_logCs);
+		//g_logThreadRun = false;
+		//DeleteCriticalSection(&g_logCs);
 		// StopDataLogFile()는 스레드 종료 경로에서 호출됨
 
 		ShutdownWMX();
