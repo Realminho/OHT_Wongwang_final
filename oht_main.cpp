@@ -6129,7 +6129,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				}
 				DoGripServoOff_Compat(hMain);
 			}
-			std::this_thread::sleep_for(std::chrono::seconds(2));
+			std::this_thread::sleep_for(std::chrono::seconds(5));
 			// 4) HasBox 상관없이 위치 정리 로직
 			if (!IsAxis2LimitOn()) {
 				AppendLog(L"[AUTO] Axis2 limit OFF -> Move Axis2 to -1000 with DO11");
