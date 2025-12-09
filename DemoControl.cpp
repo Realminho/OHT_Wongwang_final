@@ -2077,9 +2077,9 @@ void StartDemoUnload()
     if (!g_commStarted) { SetTaskState(TaskId::DemoUnload, TaskState::Failed); return; }
     if (g_taskStatus[(int)TaskId::DemoUnload].state.load() == TaskState::Running) return;
 
-    if (!CheckDemoLoadPreconditions()) {
+    if (!CheckDemoUnloadPreconditions()) {
         // 일단 Load 시퀀스 자체는 실패로 표시
-        SetTaskState(TaskId::DemoLoad, TaskState::Failed);
+        SetTaskState(TaskId::DemoUnload, TaskState::Failed);
 
         // 1) Axis2가 Limit(Up) 상태가 아니면 먼저 Up으로 정리
         if (!IsAxis2LimitOn()) {
