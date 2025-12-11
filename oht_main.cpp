@@ -366,6 +366,11 @@ bool EnsurePosModeNoStop(int axis) {
 // Limit sensor: IO_ADDR=8, IO_BIT=1 (Active High)
 // Home sensor:  IO_ADDR=8, IO_BIT=2 (Active High)
 // EtherCAT IO 보드 주소/비트
+static const int AX0_LIMIT_L_ADDR = 0;
+static const int AX0_LIMIT_L_BIT = 0;
+static const int AX0_LIMIT_R_ADDR = 0;
+static const int AX0_LIMIT_R_BIT = 1;
+
 static const int AX2_LIMIT_ADDR = 8;
 static const int AX2_LIMIT_BIT = 1;
 static const int AX2_HOME_ADDR = 8;
@@ -374,6 +379,8 @@ static const int AX2_HOME_BIT = 2;
 // 센서 활성 레벨 (필요시 LOW → HIGH로 수정)
 static const bool AX2_LIMIT_ACTIVE_HIGH = true;
 static const bool AX2_HOME_ACTIVE_HIGH = true;
+static const bool AX0_LIMIT_L_ACTIVE_HIGH = true;
+static const bool AX0_LIMIT_R_ACTIVE_HIGH = true;
 
 // 폴링/디바운스 시간
 static const DWORD AX2_SENSOR_POLL_MS = 5;
@@ -398,6 +405,19 @@ static std::atomic<DWORD> g_ax2LimitIdleTime{ 0 };   // Idle 최초 감지 시�
 static std::atomic<bool>  g_ax2ServoReady{ false };    // axis2 servo on 준비 완료 여부
 static std::atomic<DWORD> g_ax2ServoOnTime{ 0 };       // axis2 servoOn 감지 시각
 static const DWORD AX2_SENSOR_ENABLE_DELAY_MS = 1500;  // 1초 지연
+
+// ================= Axis0 Left/Right Limit 상태/블록 플래그 =================
+// AX0 쪽은 센서 읽기 결과를 "free = true, limit 감지 = false" 로 사용
+static std::atomic<bool> g_ax0LimitLFree{ true };          // true = 정상, false = L 리밋 감지
+static std::atomic<bool> g_ax0LimitRFree{ true };          // true = 정상, false = R 리밋 감지
+
+static std::atomic<bool> g_ax0LimitLLatched{ false };      // L 리밋 최초 인식 래치
+static std::atomic<bool> g_ax0LimitRLatched{ false };      // R 리밋 최초 인식 래치
+
+// L 리밋 ON → +방향 블록, R 리밋 ON → -방향 블록
+static std::atomic<bool> g_ax0BlockPlus{ false };          // Axis0 + 방향 명령 차단
+static std::atomic<bool> g_ax0BlockMinus{ false };         // Axis0 - 방향 명령 차단
+
 
 static bool IsAxis2ServoOn()
 {
@@ -533,6 +553,49 @@ static bool Axis2IsMinusCommandBlocked(long long currentPos, long long targetPos
 // Axis2 마이너스 금지 시 경고
 static void Axis2ShowMinusBlockedWarning(HWND hWnd) {
 	MessageBox(hWnd, TEXT("Axis2: Limit 센서 ON 상태입니다.\r\n-방향 명령은 허용되지 않습니다."), TEXT("Axis2 보호"), MB_ICONWARNING | MB_OK);
+}
+
+// ---------------------------------------------------------------------
+// Axis0 Limit 블록 검사 + 경고 (L=+ 방향 차단, R=- 방향 차단)
+// ---------------------------------------------------------------------
+static bool Axis0IsCommandBlocked(long long currentPos,
+	long long targetPos,
+	long long stepOrSign)
+{
+	bool blockPlus = g_ax0BlockPlus.load();
+	bool blockMinus = g_ax0BlockMinus.load();
+
+	if (!blockPlus && !blockMinus) return false;
+
+	// 조그 명령: stepOrSign = +1 / -1
+	if (stepOrSign == +1 || stepOrSign == -1) {
+		if (stepOrSign > 0 && blockPlus)  return true; // + 방향 조그 차단
+		if (stepOrSign < 0 && blockMinus) return true; // - 방향 조그 차단
+		return false;
+	}
+
+	// 일반 이동: targetPos 기준으로 방향 판단
+	long long delta = targetPos - currentPos;
+	if (delta > 0 && blockPlus)  return true; // + 방향 이동 차단
+	if (delta < 0 && blockMinus) return true; // - 방향 이동 차단
+
+	return false;
+}
+
+static void Axis0ShowBlockedWarning(HWND hWnd, int dirSign)
+{
+	if (dirSign > 0) {
+		MessageBox(hWnd,
+			TEXT("Axis0: Left Limit 센서 ON 상태입니다.\r\n+ 방향 명령은 허용되지 않습니다."),
+			TEXT("Axis0 보호"),
+			MB_ICONWARNING | MB_OK);
+	}
+	else if (dirSign < 0) {
+		MessageBox(hWnd,
+			TEXT("Axis0: Right Limit 센서 ON 상태입니다.\r\n- 방향 명령은 허용되지 않습니다."),
+			TEXT("Axis0 보호"),
+			MB_ICONWARNING | MB_OK);
+	}
 }
 
 // TCP Server globals
@@ -1319,6 +1382,15 @@ static bool StartRelMoveWithProfile(int axis, long long delta, double vpps, doub
 		}
 	}
 
+	// Axis0 보호: L/R 리밋에 따른 방향 차단
+	if (axis == 0 && g_commStarted) {
+		long long sign = (delta >= 0) ? +1 : -1;
+		if (Axis0IsCommandBlocked(cur, tgt, sign)) {
+			if (g_hMainWnd) Axis0ShowBlockedWarning(g_hMainWnd, (int)sign);
+			return false;
+		}
+	}
+
 	Motion::PosCommand pc; pc.axis = axis; pc.target = tgt;
 	pc.profile.type = ProfileType::SCurve;
 	pc.profile.velocity = (int)std::lround(vpps);
@@ -1408,6 +1480,8 @@ inline int ID_TXT_STATUS(int axis, int col) { return 8000 + axis * 30 + col; }
 // Axis2 Limit / Home 상태 표시용 텍스트
 #define ID_TXT_AX2_LIMIT  9152
 #define ID_TXT_AX2_HOME   9153
+#define ID_TXT_AX0_LIMIT_L  9154
+#define ID_TXT_AX0_LIMIT_R  9155
 
 // ==== Serial Monitor Window (separate) ====
 #define ID_EDIT_TCP_IP 9300
@@ -1548,6 +1622,16 @@ static bool StartJog(HWND hWnd, int axis, int sign) {
 		}
 	}
 
+	if (axis == 0) {
+		// Axis0: L/R 리밋 방향 차단
+		g_cm.GetStatus(&g_status);
+		long long curPos = (long long)g_status.axesStatus[0].actualPos;
+		if (Axis0IsCommandBlocked(curPos, curPos, (long long)sign)) {
+			Axis0ShowBlockedWarning(hWnd, sign);
+			return false;
+		}
+	}
+
 	//DisableAllEnabledSyncGroups();
 	if (!EnsureServoOn(axis)) return false;
 	if (!EnsurePosModeNoStop(axis)) return false;
@@ -1617,6 +1701,16 @@ static bool StartMultiJog(HWND hWnd, int sign) {
 			long long tgt = cur + (long long)(sign * 1000000000LL);
 			if (Axis2IsMinusCommandBlocked(cur, tgt, (long long)sign)) {
 				Axis2ShowMinusBlockedWarning(hWnd);
+				continue;
+			}
+		}
+
+		// Axis0 보호: L/R 리밋에 따른 방향 차단
+		if (a == 0) {
+			long long cur = (long long)g_status.axesStatus[0].actualPos;
+			long long tgt = cur + (long long)(sign * 1000000000LL);
+			if (Axis0IsCommandBlocked(cur, tgt, (long long)sign)) {
+				Axis0ShowBlockedWarning(hWnd, sign);
 				continue;
 			}
 		}
@@ -1709,6 +1803,18 @@ bool StartAbsMoveWithProfile(int axis, long long target, double vpps, double tAc
 		long long cur = (long long)g_status.axesStatus[2].actualPos;
 		if (Axis2IsMinusCommandBlocked(cur, target, 0)) {
 			if (g_hMainWnd) Axis2ShowMinusBlockedWarning(g_hMainWnd);
+			return false;
+		}
+	}
+
+	// Axis0 보호 체크: L/R 리밋에 따른 방향 금지
+	if (axis == 0 && g_commStarted) {
+		g_cm.GetStatus(&g_status);
+		long long cur = (long long)g_status.axesStatus[0].actualPos;
+		long long delta = target - cur;
+		long long sign = (delta > 0) ? +1 : (delta < 0 ? -1 : 0);
+		if (sign != 0 && Axis0IsCommandBlocked(cur, target, sign)) {
+			if (g_hMainWnd) Axis0ShowBlockedWarning(g_hMainWnd, (int)sign);
 			return false;
 		}
 	}
@@ -1864,6 +1970,9 @@ std::atomic<bool> g_periodicRun{ false };
 std::thread g_periodicThread;
 std::atomic<unsigned char> g_heartbeat{ 0 };
 
+// 운전 준비 완료 플래그 (주기 프레임에서 사용)
+std::atomic<bool> g_driveReady{ false };
+
 extern bool IsGripperOpen(); // 그립퍼 열림 상태 외부 참조
 extern bool IsGripperOpenAndIdle(); // 그립퍼 열림 상태 외부 참조
 extern bool IsGripperClosed(); // 그립퍼 닫힘 상태 외부 참조
@@ -1915,13 +2024,14 @@ unsigned char CalcPosGripCode()
 	bool isClose = IsGripperClosedAndIdle();
 	bool openinit = IsGripperOpen();
 	bool closeinit = IsGripperClosed();
+	bool hasbox = HasBox();
 
 	// Open만 ON
 	if (isOpen && !isClose || openinit)
 		return 0x01;
 
 	// Close만 ON
-	if (!isOpen && isClose || closeinit)
+	if (!isOpen && isClose || closeinit || hasbox)
 		return 0x02;
 
 	// 둘 다 OFF이거나, 둘 다 ON이거나, 판단 불가 → 0x00
@@ -1981,6 +2091,7 @@ static void SendPeriodicStateFrame(SOCKET s)
 	unsigned short almHoist = GetHoistAlarm603F();
 	unsigned char almGripL = 0x00, almGripH = 0x00; // 보류
 	unsigned char hb = g_heartbeat.load();
+	//unsigned char driveReady = g_driveReady.load() ? 0x01 : 0x00;
 
 	// [수정] 실제 페이로드 바이트 수 계산 (11바이트)
 	// mode(1) + posTravel(1) + posHoist(1) + posGrip(1)
@@ -1991,7 +2102,7 @@ static void SendPeriodicStateFrame(SOCKET s)
 	const size_t frame_capacity = 5 + payload_len + 1;
 
 	// [수정] 고정 크기 대신 계산된 크기로 배열 확보
-	unsigned char frame[5 + 0x0B + 1] = {}; // = 5 + 11 + 1 = 17 바이트
+	unsigned char frame[5 + 0x0B + 1] = {}; // = 5 + 12 + 1 = 18 바이트
 
 	// Header
 	frame[0] = 0x02;       // STX
@@ -2015,6 +2126,8 @@ static void SendPeriodicStateFrame(SOCKET s)
 	// 알람코드(그립) 2 bytes
 	frame[i++] = almGripL;
 	frame[i++] = almGripH;
+	// 운전준비 완료 플래그
+	//frame[i++] = driveReady;
 	// Heartbeat (토글 대상 값)
 	frame[i++] = hb;
 
@@ -2081,6 +2194,7 @@ static const wchar_t* DecodeOpName(unsigned char op)
 	case 0x2A: return L"Travel Position Command";
 	case 0x2B: return L"Hoist Position Command";
 	case 0x2C: return L"Grip Position Command";
+	case 0x2F: return L"Drive Ready Request";
 	case 0xFD: return L"Reset Request";
 	case 0xFE: return L"State Frame";
 	case 0xFF: return L"ACK";
@@ -2391,6 +2505,7 @@ void TcpServerThreadProc()
 
 		// 연결되자마자 주기프레임 1번 즉시 전송
 		g_heartbeat = 0;
+		g_driveReady.store(false, std::memory_order_relaxed); // ★ 운전준비 플
 		SendPeriodicStateFrame(g_clientSock);
 
 		// Periodic thread start
@@ -2578,6 +2693,10 @@ void TcpServerThreadProc()
 				}
 				SendSimpleAck(g_clientSock, 0xFD);
 				AppendLog(L"[TX] Reset ACK sent");
+
+				// 운전 준비 플래그도 리셋
+				g_driveReady.store(false, std::memory_order_relaxed);
+
 				return true;
 
 				// ---------------- COMM OPEN ----------------
@@ -2843,6 +2962,82 @@ void TcpServerThreadProc()
 				return true;
 			}
 
+			// ---------------- 운전 준비 요구 (Drive Ready) ----------------
+			case 0x2F:
+			{
+				AppendLog(L"[INFO] PLC -> PC : Drive Ready Request (0x2F)");
+
+				// 다른 모션 중이면 거부
+				bool expectedBusy = false;
+				if (!g_motionBusy.compare_exchange_strong(expectedBusy, true)) {
+					AppendLog(L"[BUSY] Drive Ready command ignored: motion already in progress");
+					return false;
+				}
+
+				// ACK 먼저 전송 (02 00 00 FF 01 2F 03)
+				SendSimpleAck(g_clientSock, 0x2F);
+				AppendLog(L"[TX] Drive Ready ACK sent");
+
+				SOCKET sockReady = g_clientSock;
+				std::thread([sockReady]() {
+					// 2) 그리퍼 상태 확인
+					unsigned char gcode = CalcPosGripCode(); // 0x00이면 중간(애매한) 상태라고 가정
+
+					wchar_t info[128];
+					swprintf_s(info, L"[ACT] DriveReady: Current GripCode=0x%02X", (unsigned)gcode);
+					AppendLog(info);
+
+					if (gcode == 0x00) {
+						// 2-1) 먼저 Close 쪽으로 정리
+						AppendLog(L"[ACT] DriveReady: Grip ambiguous -> Close then ServoOff");
+						DoClose_Compat(g_hDemoWnd);
+						(void)WaitUntil(IsGripperClosedAndIdle, 5000);
+
+						// 2-2) Close 상태에서 Servo OFF
+						DoGripServoOff_Compat(g_hDemoWnd);
+
+						// 2-3) 박스 보유 여부 체크
+						if (HasBox()) {
+							// 박스 들고 있으면 Close+ServoOff 상태 유지하고 종료
+							AppendLog(L"[ACT] DriveReady: HasBox()==true -> keep Close+ServoOff");
+						}
+						else {
+							// 박스가 없다면 Open 상태로 정리
+							AppendLog(L"[ACT] DriveReady: HasBox()==false -> Open then ServoOff");
+							DoOpen_Compat(g_hDemoWnd);
+							(void)WaitUntil(IsGripperOpenAndIdle, 5000);
+							DoGripServoOff_Compat(g_hDemoWnd);
+						}
+					}
+					else {
+						// gcode != 0x00 이면 (이미 Open 또는 Close 쪽이라면) 추가 그리퍼 동작 없이 종료
+						AppendLog(L"[ACT] DriveReady: Grip code already non-zero, no extra grip motion");
+					}
+
+					// 1) Axis2가 Limit(Up) 상태가 아니면 먼저 Up으로 정리
+					unsigned char hcode = CalcPosHoistCode();
+					swprintf_s(info, L"[ACT] DriveReady: Current HoistCode=0x%02X", (unsigned)hcode);
+					AppendLog(info);
+
+					if (hcode != 0x03) {
+						AppendLog(L"[ACT] DriveReady: Hoist not UP(0x03) -> DoUp()");
+						DoUp();
+						(void)WaitUntil(IsAxis2Up, 20000);
+					}
+					else {
+						AppendLog(L"[ACT] DriveReady: Hoist already UP(0x03)");
+					}
+
+					// 운전 준비 완료 플래그 ON
+					g_driveReady.store(true, std::memory_order_relaxed);
+					AppendLog(L"[INFO] DriveReady sequence complete -> driveReady = 1");
+
+					g_motionBusy.store(false);
+					}).detach();
+
+				return true;
+			}
+
 			// ---------------- ACK ----------------
 			case 0xFF: // ACK
 				AppendLog(L"[INFO] PLC -> PC : ACK received");
@@ -3000,6 +3195,19 @@ static void DoAbsMoveAxis(HWND hWnd, int axis) {
 		}
 	}
 
+	if (axis == 0) {
+		g_cm.GetStatus(&g_status);
+		long long cur = (long long)g_status.axesStatus[0].actualPos;
+		double tgtD = GetDlgDouble(hWnd, ID_EDIT_POS_A(axis), 0.0);
+		long long tgt = (long long)std::llround(tgtD);
+		long long delta = tgt - cur;
+		long long sign = (delta > 0) ? +1 : (delta < 0 ? -1 : 0);
+		if (sign != 0 && Axis0IsCommandBlocked(cur, tgt, sign)) {
+			Axis0ShowBlockedWarning(hWnd, (int)sign);
+			return;
+		}
+	}
+
 	//DisableAllEnabledSyncGroups();
 	if (!EnsureServoOn(axis) || !EnsurePosModeNoStop(axis)) return;
 	double tgt = GetDlgDouble(hWnd, ID_EDIT_POS_A(axis), 0.0);
@@ -3019,6 +3227,18 @@ static void DoRelMoveAxis(HWND hWnd, int axis, int dir) {
 		long long tgt = cur + (long long)std::llround(step);
 		if (Axis2IsMinusCommandBlocked(cur, tgt, (long long)dir)) {
 			Axis2ShowMinusBlockedWarning(hWnd);
+			return;
+		}
+	}
+
+	// Axis0 보호: 상대 이동 전 L/R 리밋 방향 차단
+	if (axis == 0) {
+		g_cm.GetStatus(&g_status);
+		long long cur = (long long)g_status.axesStatus[0].actualPos;
+		double step = GetDlgDouble(hWnd, ID_EDIT_POS_A(axis), 0.0) * dir;
+		long long tgt = cur + (long long)std::llround(step);
+		if (Axis0IsCommandBlocked(cur, tgt, (long long)dir)) {
+			Axis0ShowBlockedWarning(hWnd, dir);
 			return;
 		}
 	}
@@ -3049,6 +3269,19 @@ static void DoMultiAbs(HWND hWnd) {
 			}
 		}
 
+		// Axis0 보호: L/R 리밋에 따른 방향 금지
+		if (a == 0) {
+			g_cm.GetStatus(&g_status);
+			long long cur = (long long)g_status.axesStatus[0].actualPos;
+			long long tgt = (long long)std::llround(GetDlgDouble(hWnd, ID_EDIT_POS_A(0), 0.0));
+			long long delta = tgt - cur;
+			long long sign = (delta > 0) ? +1 : (delta < 0 ? -1 : 0);
+			if (sign != 0 && Axis0IsCommandBlocked(cur, tgt, sign)) {
+				Axis0ShowBlockedWarning(hWnd, (int)sign);
+				continue;
+			}
+		}
+
 		double tgt = GetDlgDouble(hWnd, ID_EDIT_POS_A(a), 0.0);
 		double v = GetDlgDouble(hWnd, ID_EDIT_VEL_A(a), 10000.0);
 		double ta = GetDlgDouble(hWnd, ID_EDIT_ACCT_A(a), 100.0);
@@ -3070,6 +3303,19 @@ static void DoMultiRel(HWND hWnd) {
 			int dir = (step >= 0) ? +1 : -1;
 			if (Axis2IsMinusCommandBlocked(cur, tgt, (long long)dir)) {
 				Axis2ShowMinusBlockedWarning(hWnd);
+				continue;
+			}
+		}
+
+		// Axis0 보호: 상대 이동 방향 차단
+		if (a == 0) {
+			g_cm.GetStatus(&g_status);
+			long long cur = (long long)g_status.axesStatus[0].actualPos;
+			double step = GetDlgDouble(hWnd, ID_EDIT_POS_A(0), 0.0);
+			long long tgt = cur + (long long)std::llround(step);
+			int dir = (step >= 0) ? +1 : -1;
+			if (Axis0IsCommandBlocked(cur, tgt, (long long)dir)) {
+				Axis0ShowBlockedWarning(hWnd, dir);
 				continue;
 			}
 		}
@@ -3719,6 +3965,17 @@ static void Sync_Control_Jog(HWND hWnd, int sign) {
 		}
 	}
 
+	// Axis0 보호: L/R 리밋에 따른 방향 조그 차단
+	if (ax == 0) {
+		g_cm.GetStatus(&g_status);
+		long long cur = (long long)g_status.axesStatus[0].actualPos;
+		long long tgt = cur + (long long)sign * 1000000000LL;
+		if (Axis0IsCommandBlocked(cur, tgt, (long long)sign)) {
+			Axis0ShowBlockedWarning(hWnd, sign);
+			return;
+		}
+	}
+
 	if (!EnsureServoOn(ax) || !EnsurePosModeNoStop(ax)) return;
 	double vpps = GetDlgDouble(hWnd, ID_SYNC_JOG_SPEED, 10000.0);
 	double tAcc = GetDlgDouble(hWnd, ID_SYNC_ACC, 100.0);
@@ -3760,6 +4017,19 @@ static void Sync_Control_Abs(HWND hWnd) {
 		}
 	}
 
+	// Axis0 보호: 절대 이동 방향 차단 체크
+	if (ax == 0) {
+		g_cm.GetStatus(&g_status);
+		long long cur = (long long)g_status.axesStatus[0].actualPos;
+		long long tgtLL = (long long)std::llround(tgt);
+		long long delta = tgtLL - cur;
+		long long sign = (delta > 0) ? +1 : (delta < 0 ? -1 : 0);
+		if (sign != 0 && Axis0IsCommandBlocked(cur, tgtLL, sign)) {
+			Axis0ShowBlockedWarning(hWnd, (int)sign);
+			return;
+		}
+	}
+
 	StartAbsMoveWithProfile(ax, (long long)std::llround(tgt), v, ta, td);
 }
 static void Sync_Control_Rel(HWND hWnd, int sign) {
@@ -3778,6 +4048,14 @@ static void Sync_Control_Rel(HWND hWnd, int sign) {
 	if (ax == 2) {
 		if (Axis2IsMinusCommandBlocked(cur, tgt, (long long)sign)) {
 			Axis2ShowMinusBlockedWarning(hWnd);
+			return;
+		}
+	}
+
+	// Axis0 보호: 상대 이동 방향 차단 체크
+	if (ax == 0) {
+		if (Axis0IsCommandBlocked(cur, tgt, (long long)sign)) {
+			Axis0ShowBlockedWarning(hWnd, sign);
 			return;
 		}
 	}
@@ -4379,6 +4657,7 @@ static void UpdateStatus(HWND hWnd) {
 	if (HWND h = GetDlgItem(hWnd, ID_TXT_AX2_HOME)) {
 		SetWindowText(h, g_ax2ServoReady ? (g_ax2HomeOn ? TEXT("ON") : TEXT("OFF")) : TEXT("WAIT"));
 	}
+
 	if (HWND h = GetDlgItem(hWnd, ID_TXT_MODE_STATE)) {
 		SetWindowText(h, g_autoMode ? TEXT("MODE: AUTO") : TEXT("MODE: MANUAL"));
 	}
@@ -5898,6 +6177,13 @@ static void CreateUI(HWND h) {
 	CreateWindow(TEXT("STATIC"), TEXT("A2 Home:"), WS_CHILD | WS_VISIBLE | SS_LEFT, 1400, 940, 70, 20, h, nullptr, nullptr, nullptr);
 	CreateWindow(TEXT("STATIC"), TEXT("-"), WS_CHILD | WS_VISIBLE | SS_LEFT | WS_BORDER, 1470, 937, 140, 24, h, (HMENU)(INT_PTR)ID_TXT_AX2_HOME, nullptr, nullptr);
 
+	// ================= Axis0 Limit L/R 상태 표시 (Axis2 옆) =================
+	CreateWindow(TEXT("STATIC"), TEXT("A0 L-Lim:"), WS_CHILD | WS_VISIBLE | SS_LEFT, 1170, 910, 70, 20, h, nullptr, nullptr, nullptr);
+	CreateWindow(TEXT("STATIC"), TEXT("-"),	WS_CHILD | WS_VISIBLE | SS_LEFT | WS_BORDER, 1240, 907, 140, 24, h, (HMENU)(INT_PTR)ID_TXT_AX0_LIMIT_L, nullptr, nullptr);
+
+	CreateWindow(TEXT("STATIC"), TEXT("A0 R-Lim:"), WS_CHILD | WS_VISIBLE | SS_LEFT, 1170, 940, 70, 20, h, nullptr, nullptr, nullptr);
+	CreateWindow(TEXT("STATIC"), TEXT("-"),	WS_CHILD | WS_VISIBLE | SS_LEFT | WS_BORDER, 1240, 937, 140, 24, h, (HMENU)(INT_PTR)ID_TXT_AX0_LIMIT_R, nullptr, nullptr);
+
 	int x = 10, y = 70, w = 1800, hgt = 120, gap = 6;
 	for (int a = 0; a < 4; ++a) CreateAxisGroup(h, a, x, y + a * (hgt + gap), w, hgt);
 
@@ -6014,6 +6300,7 @@ static void AutoStart(HWND hWnd)
 	EnsureServoOn(2);
 	EnsurePosModeNoStop(2);
 
+	//std::this_thread::sleep_for(std::chrono::seconds(3));
 	//// Sync Group 0: Master=0, Slave=[1]
 	//if (g_commStarted) {
 	//	Sync::SyncGroup grp{};
@@ -6053,6 +6340,7 @@ static void AutoStart(HWND hWnd)
 
 	UpdateEStopUi(hWnd, false);
 	UpdateTcpUiState(hWnd);
+	
 }
 
 
@@ -6095,17 +6383,29 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		g_ax2HomeLastTick = GetTickCount();
 		g_ax2HomeRampIssued = false;
 
+		// ================= Axis0 flags reset =================
+	// 시작 시에는 리밋이 안 물린 상태(= free = true)로 가정
+		g_ax0LimitLFree = true;
+		g_ax0LimitRFree = true;
+
+		g_ax0LimitLLatched = false;
+		g_ax0LimitRLatched = false;
+
+		// 리밋 블록도 모두 해제 상태로 시작
+		g_ax0BlockPlus = false;   // + 방향 명령 허용
+		g_ax0BlockMinus = false;   // - 방향 명령 허용
+
 		//// [AUTO] 실행 시 자동 초기화 (지연 증가)
 		std::thread([](HWND hMain) {
 			bool setupOk = true;   // 전체 초기 세팅 성공 여부 플래그
 
 			// 1) UI/서비스 준비 시간
-			Sleep(500);
+			std::this_thread::sleep_for(std::chrono::seconds(1));
 			AutoStart(hMain);
 
 			// 2) AutoStart 후 TCP 시작
 			StartTcpServer();
-			Sleep(1000);
+			std::this_thread::sleep_for(std::chrono::seconds(1));
 
 		// 3) 그리퍼 상태 정리 (HasBox 기준)
 			bool okGrip = false;
@@ -6114,129 +6414,136 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				DoClose_Compat(hMain);
 				okGrip = WaitUntil(IsGripperClosedAndIdle, 10000);
 				if (!okGrip) {
+					
 					AppendLog(L"[AUTO][WARN] Grip Close or Idle wait FAILED");
 					setupOk = false;
 				}
 				DoGripServoOff_Compat(hMain);
+				
 			}
 			else {
 				AppendLog(L"[AUTO] HasBox()==false -> Grip Open + ServoOff");
 				DoOpen_Compat(hMain);
 				okGrip = WaitUntil(IsGripperOpenAndIdle, 10000);
 				if (!okGrip) {
+					
 					AppendLog(L"[AUTO][WARN] Grip Open or Idle wait FAILED");
 					setupOk = false;
 				}
 				DoGripServoOff_Compat(hMain);
+				
 			}
-			std::this_thread::sleep_for(std::chrono::seconds(5));
-			// 4) HasBox 상관없이 위치 정리 로직
-			if (!IsAxis2LimitOn()) {
-				AppendLog(L"[AUTO] Axis2 limit OFF -> Move Axis2 to -1000 with DO11");
+			
+			//std::this_thread::sleep_for(std::chrono::seconds(2));
+			//// 4) HasBox 상관없이 위치 정리 로직
+			//if (!IsAxis2LimitOn()) {
+			//	AppendLog(L"[AUTO] Axis2 limit OFF -> Move Axis2 to -1000 with DO11");
 
-				// 1) Axis2를 -1000으로 이동 (직접 프로파일 명령 사용)
-				//ToggleDO_HW(11, true, hMain);
+			//	// 1) Axis2를 -1000으로 이동 (직접 프로파일 명령 사용)
+			//	//ToggleDO_HW(11, true, hMain);
 
-				bool started = StartAbsMoveWithProfile(
-					2,          // axis
-					-1000,      // target position
-					3000.0,     // velocity
-					1000.0,     // tAcc (ms)
-					1000.0      // tDec (ms)
-				);
+			//	bool started = StartAbsMoveWithProfile(
+			//		2,          // axis
+			//		-1000,      // target position
+			//		3000.0,     // velocity
+			//		1000.0,     // tAcc (ms)
+			//		1000.0      // tDec (ms)
+			//	);
 
-				bool okAxis2 = false;
-				if (started) {
-					okAxis2 = WaitUntil(IsAxis2LimitOn, 10000);
-				}
-				else {
-					AppendLog(L"[AUTO][WARN] StartAbsMoveWithProfile(axis2) FAILED");
-				}
+			//	bool okAxis2 = false;
+			//	if (started) {
+			//		okAxis2 = WaitUntil(IsAxis2LimitOn, 10000);
+			//	}
+			//	else {
+			//		AppendLog(L"[AUTO][WARN] StartAbsMoveWithProfile(axis2) FAILED");
+			//	}
 
-				//ToggleDO_HW(11, false, hMain);
+			//	
 
-				if (!started || !okAxis2) {
-					AppendLog(L"[AUTO][WARN] Axis2 move to -1000 FAILED or TIMEOUT");
-					setupOk = false;
-				}
-				else {
-					AppendLog(L"[AUTO] Axis2 move to -1000 DONE");
-				}
+			//	if (!started || !okAxis2) {
+			//		AppendLog(L"[AUTO][WARN] Axis2 move to -1000 FAILED or TIMEOUT");
+			//		setupOk = false;
+			//	}
+			//	else {
+			//		AppendLog(L"[AUTO] Axis2 move to -1000 DONE");
+			//		ToggleDO_HW(11, false, hMain);
+			//	}
 
-				// 2) 다시 바코드 위치 확인 (주행 위치)
-				//unsigned char code = CalcPosTravelCode(); // 0x01 = Load(476774)
+			//	// 2) 다시 바코드 위치 확인 (주행 위치)
+			//	//unsigned char code = CalcPosTravelCode(); // 0x01 = Load(476774)
 
-				//if (code == 0x01) {
-				//	AppendLog(L"[AUTO] After Axis2 move: Travel at Load(476774) -> no travel move");
-				//}
-				//else {
-				//	AppendLog(L"[AUTO] After Axis2 move: not at Load -> GO_Conveyor() with DO11");
+			//	//if (code == 0x01) {
+			//	//	AppendLog(L"[AUTO] After Axis2 move: Travel at Load(476774) -> no travel move");
+			//	//}
+			//	//else {
+			//	//	AppendLog(L"[AUTO] After Axis2 move: not at Load -> GO_Conveyor() with DO11");
 
-				//	//ToggleDO_HW(11, true, hMain);
+			//	//	//ToggleDO_HW(11, true, hMain);
 
-				//	GO_Conveyor();
-				//	bool okConv = WaitTaskFinished(TaskId::GoConveyor, 30000);
+			//	//	GO_Conveyor();
+			//	//	bool okConv = WaitTaskFinished(TaskId::GoConveyor, 30000);
 
-				//	AppendLog(okConv
-				//		? L"[AUTO] GO_Conveyor DONE"
-				//		: L"[AUTO][WARN] GO_Conveyor FAILED or TIMEOUT");
+			//	//	AppendLog(okConv
+			//	//		? L"[AUTO] GO_Conveyor DONE"
+			//	//		: L"[AUTO][WARN] GO_Conveyor FAILED or TIMEOUT");
 
-				//	if (!okConv) {
-				//		setupOk = false;
-				//	}
+			//	//	if (!okConv) {
+			//	//		setupOk = false;
+			//	//	}
 
-				//	//ToggleDO_HW(11, false, hMain);
-				//}
-			}
-			else {
-				AppendLog(L"[AUTO] Axis2 limit ON -> check travel barcode");
+			//	//	//ToggleDO_HW(11, false, hMain);
+			//	//}
+			//}
+			//else {
+			//	AppendLog(L"[AUTO] Axis2 limit ON -> check travel barcode");
+			//	ToggleDO_HW(11, false, hMain);
 
-				//unsigned char code = CalcPosTravelCode(); // 0x01 = Load(476774), 0x02 = Unload(491332), etc.
+			//	//unsigned char code = CalcPosTravelCode(); // 0x01 = Load(476774), 0x02 = Unload(491332), etc.
 
-				//if (code == 0x01) {
-				//	// 이미 Load 위치(476774) → 주행 안 함
-				//	AppendLog(L"[AUTO] Travel at Load(476774) -> no travel move");
-				//}
-				//else {
-				//	// Limit ON인데 Load 위치가 아니면 Conveyor 위치로 이동
-				//	AppendLog(L"[AUTO] Axis2 limit ON & not at Load -> GO_Conveyor() with DO11");
+			//	//if (code == 0x01) {
+			//	//	// 이미 Load 위치(476774) → 주행 안 함
+			//	//	AppendLog(L"[AUTO] Travel at Load(476774) -> no travel move");
+			//	//}
+			//	//else {
+			//	//	// Limit ON인데 Load 위치가 아니면 Conveyor 위치로 이동
+			//	//	AppendLog(L"[AUTO] Axis2 limit ON & not at Load -> GO_Conveyor() with DO11");
 
-				//	// 축 동작 시작: DO11 ON
-				//	//ToggleDO_HW(11, true, hMain);
+			//	//	// 축 동작 시작: DO11 ON
+			//	//	//ToggleDO_HW(11, true, hMain);
 
-				//	GO_Conveyor();
-				//	bool okConv = WaitTaskFinished(TaskId::GoConveyor, 30000);
+			//	//	GO_Conveyor();
+			//	//	bool okConv = WaitTaskFinished(TaskId::GoConveyor, 30000);
 
-				//	AppendLog(okConv
-				//		? L"[AUTO] GO_Conveyor DONE"
-				//		: L"[AUTO][WARN] GO_Conveyor FAILED or TIMEOUT");
+			//	//	AppendLog(okConv
+			//	//		? L"[AUTO] GO_Conveyor DONE"
+			//	//		: L"[AUTO][WARN] GO_Conveyor FAILED or TIMEOUT");
 
-				//	if (!okConv) {
-				//		setupOk = false;
-				//	}
+			//	//	if (!okConv) {
+			//	//		setupOk = false;
+			//	//	}
 
-					// 동작 종료: DO11 OFF
-					//ToggleDO_HW(11, false, hMain);
-				//}
-			}
+			//		// 동작 종료: DO11 OFF
+			//		//ToggleDO_HW(11, false, hMain);
+			//	//}
+			//}
 
-			// 5) 전체 초기 세팅 완료 메시지 (성공/실패 분기)
-			if (setupOk) {
-				MessageBox(
-					hMain,
-					TEXT("초기 세팅이 정상적으로 완료되었습니다."),
-					TEXT("초기 세팅"),
-					MB_OK | MB_ICONINFORMATION
-				);
-			}
-			else {
-				MessageBox(
-					hMain,
-					TEXT("초기 세팅 중 일부 단계에서 오류가 발생했습니다.\n로그를 확인해 주세요."),
-					TEXT("초기 세팅 오류"),
-					MB_OK | MB_ICONWARNING
-				);
-			}
+			//// 5) 전체 초기 세팅 완료 메시지 (성공/실패 분기)
+			//if (setupOk) {
+			//	MessageBox(
+			//		hMain,
+			//		TEXT("초기 세팅이 정상적으로 완료되었습니다."),
+			//		TEXT("초기 세팅"),
+			//		MB_OK | MB_ICONINFORMATION
+			//	);
+			//}
+			//else {
+			//	MessageBox(
+			//		hMain,
+			//		TEXT("초기 세팅 중 일부 단계에서 오류가 발생했습니다.\n로그를 확인해 주세요."),
+			//		TEXT("초기 세팅 오류"),
+			//		MB_OK | MB_ICONWARNING
+			//	);
+			//}
 
 		}, hWnd).detach();
 
@@ -6511,6 +6818,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				if (HWND h = GetDlgItem(hWnd, ID_TXT_AX2_LIMIT)) SetWindowText(h, TEXT("-"));
 				if (HWND h = GetDlgItem(hWnd, ID_TXT_AX2_HOME))  SetWindowText(h, TEXT("-"));
 
+				if (HWND h = GetDlgItem(hWnd, ID_TXT_AX0_LIMIT_L)) SetWindowText(h, TEXT("-"));
+				if (HWND h = GetDlgItem(hWnd, ID_TXT_AX0_LIMIT_R))  SetWindowText(h, TEXT("-"));
+
 				UpdateEStopUi(hWnd, false);
 				UpdateTcpUiState(hWnd);
 
@@ -6581,6 +6891,23 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				if (HWND h = GetDlgItem(hWnd, ID_TXT_AX2_HOME))  SetWindowText(h, homeRaw ? TEXT("ON") : TEXT("OFF"));
 			}
 
+			// ================= Axis0 L/R Limit 표시 =================
+			// g_ax0LimitLFree / g_ax0LimitRFree 는:
+			//   true  = free (리밋 안 물림)
+			//   false = limit 감지 상태
+			// UI는 직관적으로 "FREE"/"LIMIT" 로 표시
+			if (HWND h = GetDlgItem(hWnd, ID_TXT_AX0_LIMIT_L)) {
+				SetWindowText(h,
+					g_ax0LimitLFree.load()
+					? TEXT("OFF")    // 정상
+					: TEXT("ON")); // L 리밋 감지
+			}
+			if (HWND h = GetDlgItem(hWnd, ID_TXT_AX0_LIMIT_R)) {
+				SetWindowText(h,
+					g_ax0LimitRFree.load()
+					? TEXT("OFF")    // 정상
+					: TEXT("ON")); // R 리밋 감지
+			}
 
 			// ============================================
 			// 4) Axis2 Limit / Home 동작 처리 (ServoReady 후만!)
@@ -6642,6 +6969,55 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				}
 			}
 
+			// ============================================
+		// 4-1) Axis0 Left/Right Limit 처리
+		//      - 센서 미인식: true, 인식(리밋): false 기준
+		//      - L 리밋: + 방향 차단, R 리밋: - 방향 차단
+		// ============================================
+			{
+				// 센서 읽기 결과를 "free" 개념으로 사용
+				bool leftFree = ReadInputBit(AX0_LIMIT_L_ADDR, AX0_LIMIT_L_BIT, AX0_LIMIT_L_ACTIVE_HIGH);
+				bool rightFree = ReadInputBit(AX0_LIMIT_R_ADDR, AX0_LIMIT_R_BIT, AX0_LIMIT_R_ACTIVE_HIGH);
+
+				g_ax0LimitLFree = leftFree;
+				g_ax0LimitRFree = rightFree;
+
+				// ----- Left limit: free(false -> true가 아니라 free(true -> false) 변화가 리밋 인입) -----
+				if (!leftFree)
+				{
+					// L 리밋 처음 감지 시 급정지
+					if (!g_ax0LimitLLatched.exchange(true))
+					{
+						StopAxis(0);      // Axis0 급정지
+					}
+					// L 리밋 ON 동안 + 방향 명령 차단
+					g_ax0BlockPlus = true;
+				}
+				else
+				{
+					// L 리밋 해제
+					g_ax0LimitLLatched = false;
+					g_ax0BlockPlus = false;
+				}
+
+				// ----- Right limit -----
+				if (!rightFree)
+				{
+					// R 리밋 처음 감지 시 급정지
+					if (!g_ax0LimitRLatched.exchange(true))
+					{
+						StopAxis(0);      // Axis0 급정지
+					}
+					// R 리밋 ON 동안 - 방향 명령 차단
+					g_ax0BlockMinus = true;
+				}
+				else
+				{
+					// R 리밋 해제
+					g_ax0LimitRLatched = false;
+					g_ax0BlockMinus = false;
+				}
+			}
 
 			// ============================================
 			// 5) Zone 관련 처리 (기존 유지)

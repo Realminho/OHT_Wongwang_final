@@ -1663,6 +1663,8 @@ void DoClose_Compat(HWND hWnd)
 void DoGripServoOff_Compat(HWND hWnd) {
     ToggleDO_HW(10, true, hWnd); // STO ON (펄스)
     ToggleDO_HW(10, false, hWnd); // STO ON (펄스)
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+	ToggleDO_HW(11, false, hWnd); // LED OFF
     SetTaskState(TaskId::GripServoOff, TaskState::Done);
 }
 
@@ -1706,7 +1708,7 @@ void Go_Workstation() {
     BarcodeParams p{};
     p.axis = 0;
     p.targetBarcodeAbs = 491332;
-    p.mainVel = 15000.0; p.mainAcc = 1500.0; p.mainDec = 3000.0;
+    p.mainVel = 8000.0; p.mainAcc = 1000.0; p.mainDec = 2000.0;
     p.corrVel = 1000.0; p.corrAcc = 1000.0; p.corrDec = 2000.0;
     p.deadband = 2;
     p.gear = 4.3; p.wheelDia = 70.0; p.motorCpr = 10000.0; p.bcMmPerCnt = 0.1;
@@ -1717,7 +1719,7 @@ void GO_Conveyor() {
     BarcodeParams p{};
     p.axis = 0;
     p.targetBarcodeAbs = 476774;
-    p.mainVel = 15000.0; p.mainAcc = 1500.0; p.mainDec = 3000.0;
+    p.mainVel = 8000.0; p.mainAcc = 1000.0; p.mainDec = 2000.0;
     p.corrVel = 1000.0; p.corrAcc = 1000.0; p.corrDec = 2000.0;
     p.deadband = 2;
     p.gear = 4.3; p.wheelDia = 70.0; p.motorCpr = 10000.0; p.bcMmPerCnt = 0.1;
@@ -1912,7 +1914,7 @@ void StartDemoWorkWithBox()
             if (!WaitUntil(IsAxis2Up, 20000))
                 ok = false;
         }
-
+        std::this_thread::sleep_for(std::chrono::seconds(1));
         // 5. Conveyor 위치로 이동  → 바코드 기준 Conveyor 도달까지 대기
         if (ok) {
             GO_Conveyor();
