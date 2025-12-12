@@ -2010,33 +2010,35 @@ static unsigned char CalcPosHoistCode()
 	return 0x00;
 }
 
+
 unsigned char CalcPosGripCode()
 {
+	
+
+	// 2) 오버라이드가 0x00이면 기존 자동 판정 로직 사용
 	// 진행중이면 0x00
 	if (g_gripBusy.load()) return 0x00;
 
 	// Motioning 입력(DI0)을 참조: ON이면 동작중이므로 0x00
-	// g_diStable[0] == true 면 Motioning ON으로 사용하고 있으므로, true => 동작중
 	if (g_diStable[0]) return 0x00;
 
-	// DemoControl 쪽 Gripper 판단 로직 재사용
 	bool isOpen = IsGripperOpenAndIdle();
 	bool isClose = IsGripperClosedAndIdle();
 	bool openinit = IsGripperOpen();
 	bool closeinit = IsGripperClosed();
-	bool hasbox = HasBox();
 
 	// Open만 ON
 	if (isOpen && !isClose || openinit)
 		return 0x01;
 
 	// Close만 ON
-	if (!isOpen && isClose || closeinit || hasbox)
+	if (!isOpen && isClose || closeinit)
 		return 0x02;
 
 	// 둘 다 OFF이거나, 둘 다 ON이거나, 판단 불가 → 0x00
 	return 0x00;
 }
+
 
 
 // 알람코드(주행축): axis0/1 중 0이 아닌 603F 반환(우선 axis0)
@@ -6405,35 +6407,74 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 			// 2) AutoStart 후 TCP 시작
 			StartTcpServer();
-			std::this_thread::sleep_for(std::chrono::seconds(1));
+			std::this_thread::sleep_for(std::chrono::seconds(2));
 
 		// 3) 그리퍼 상태 정리 (HasBox 기준)
 			bool okGrip = false;
-			if (HasBox()) {
+			bool g_code = CalcPosGripCode();
+			if (HasBox() && g_code == 02) {
+				//AppendLog(L"[AUTO] HasBox()==true -> Grip Close + ServoOff");
+				//DoClose_Compat(hMain);
+				DoGripServoOff_Compat(hMain);
+				//okGrip = WaitTaskFinished(TaskId::GripClose, 5000);
+				//if (!okGrip) {
+				//	
+				//	AppendLog(L"[AUTO][WARN] Grip Close or Idle wait FAILED");
+				//	setupOk = false;
+				//}
+				//
+				//SetTaskState(TaskId::GripClose, TaskState::Done);
+				//DoGripServoOff_Compat(hMain);
+				//
+				//AppendLog(L"[AUTO] Grip Close -> GripCode=0x02 (Close) forced");
+				
+			}
+			else if (HasBox() && g_code != 02) {
 				AppendLog(L"[AUTO] HasBox()==true -> Grip Close + ServoOff");
 				DoClose_Compat(hMain);
-				okGrip = WaitUntil(IsGripperClosedAndIdle, 10000);
+				//DoGripServoOff_Compat(hMain);
+				okGrip = WaitTaskFinished(TaskId::GripClose, 5000);
 				if (!okGrip) {
-					
+
 					AppendLog(L"[AUTO][WARN] Grip Close or Idle wait FAILED");
 					setupOk = false;
 				}
-				DoGripServoOff_Compat(hMain);
+
 				
+				//DoGripServoOff_Compat(hMain);
+				//SetTaskState(TaskId::GripClose, TaskState::Done);
+				AppendLog(L"[AUTO] Grip Close -> GripCode=0x02 (Close) forced");
 			}
-			else {
+			else if(NoBox() && g_code != 01){
 				AppendLog(L"[AUTO] HasBox()==false -> Grip Open + ServoOff");
 				DoOpen_Compat(hMain);
-				okGrip = WaitUntil(IsGripperOpenAndIdle, 10000);
+				okGrip = WaitTaskFinished(TaskId::GripOpen, 5000);
 				if (!okGrip) {
 					
 					AppendLog(L"[AUTO][WARN] Grip Open or Idle wait FAILED");
 					setupOk = false;
 				}
-				DoGripServoOff_Compat(hMain);
+				//DoGripServoOff_Compat(hMain);
+				//SetTaskState(TaskId::GripOpen, TaskState::Done);
+				
+				
+				AppendLog(L"[AUTO] Grip Open -> GripCode=0x01 (Open) forced");
 				
 			}
-			
+			else if(NoBox() && g_code == 01){
+				DoGripServoOff_Compat(hMain);
+				
+				//SetTaskState(TaskId::GripOpen, TaskState::Done);
+				
+
+				AppendLog(L"[AUTO] Grip Open -> GripCode=0x01 (Open) forced");
+			}
+			MessageBox(
+						hMain,
+						TEXT("초기 세팅이 정상적으로 완료되었습니다."),
+						TEXT("초기 세팅"),
+						MB_OK | MB_ICONINFORMATION
+					);
 			//std::this_thread::sleep_for(std::chrono::seconds(2));
 			//// 4) HasBox 상관없이 위치 정리 로직
 			//if (!IsAxis2LimitOn()) {
