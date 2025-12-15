@@ -1234,6 +1234,8 @@ static const TCHAR* g_DOFuncNames[16] = {
     nullptr         // 15
 };
 
+std::atomic<unsigned char> g_doShadow[32];  // 0/1
+
 // 출력 동작(펄스 예약/오버레이/입력샘플 반영)
 void ToggleDO_HW(int pin, bool turnOn, HWND hWnd)
 {
@@ -1247,6 +1249,11 @@ void ToggleDO_HW(int pin, bool turnOn, HWND hWnd)
     uint32_t st = 0;
     GPIO_Single_SetDirection(gp, true, &st);
     GPIO_Single_SetLevel(gp, turnOn, &st);
+
+    // ★ DO Shadow 업데이트 (CalcPosGripCode에서 이걸 보고 판단)
+    if (0 <= pin && pin < 32) {
+        g_doShadow[pin].store(turnOn ? 1 : 0, std::memory_order_relaxed);
+    }
 
     // UI 즉시 반영
     if (g_swDO[pin]) {

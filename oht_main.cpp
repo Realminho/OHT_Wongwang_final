@@ -2010,34 +2010,49 @@ static unsigned char CalcPosHoistCode()
 	return 0x00;
 }
 
+static std::atomic<DWORD> g_gripBusyStartTick{ 0 };
+
+// “중복 명령 후 stuck”으로 판단할 시간(ms) - 필요에 맞게 조절
+static constexpr DWORD GRIP_STUCK_REPORT_MS = 5000; // 예: 2초
+extern std::atomic<unsigned char> g_doShadow[32];
 
 unsigned char CalcPosGripCode()
 {
-	
+	// 진행중이면 0x00 (기본)
+	bool busy = g_gripBusy.load(std::memory_order_relaxed) || g_diStable[0];
+	if (busy) {
+		DWORD now = GetTickCount();
+		DWORD t0 = g_gripBusyStartTick.load(std::memory_order_relaxed);
+		if (t0 == 0) g_gripBusyStartTick.store(now, std::memory_order_relaxed);
 
-	// 2) 오버라이드가 0x00이면 기존 자동 판정 로직 사용
-	// 진행중이면 0x00
-	if (g_gripBusy.load()) return 0x00;
+		DWORD elapsed = now - g_gripBusyStartTick.load(std::memory_order_relaxed);
 
-	// Motioning 입력(DI0)을 참조: ON이면 동작중이므로 0x00
-	if (g_diStable[0]) return 0x00;
+		// ★ 일정 시간 이상 진행중이면 DO 토글 상태로 강제 보고
+		if (elapsed >= GRIP_STUCK_REPORT_MS) {
+			bool do8 = (g_doShadow[8].load(std::memory_order_relaxed) != 0);
+			bool do9 = (g_doShadow[9].load(std::memory_order_relaxed) != 0);
 
+			if (do8 && !do9) return 0x01; // Open 의도
+			if (do9 && !do8) return 0x02; // Close 의도
+		}
+
+		return 0x00;
+	}
+
+	// Busy 풀리면 타이머 리셋
+	g_gripBusyStartTick.store(0, std::memory_order_relaxed);
+
+	// ---- 이하 기존 자동 판정 로직 ----
 	bool isOpen = IsGripperOpenAndIdle();
 	bool isClose = IsGripperClosedAndIdle();
 	bool openinit = IsGripperOpen();
 	bool closeinit = IsGripperClosed();
 
-	// Open만 ON
-	if (isOpen && !isClose || openinit)
-		return 0x01;
-
-	// Close만 ON
-	if (!isOpen && isClose || closeinit)
-		return 0x02;
-
-	// 둘 다 OFF이거나, 둘 다 ON이거나, 판단 불가 → 0x00
+	if ((isOpen && !isClose) || openinit)  return 0x01;
+	if ((!isOpen && isClose) || closeinit) return 0x02;
 	return 0x00;
 }
+
 
 
 
@@ -2093,18 +2108,18 @@ static void SendPeriodicStateFrame(SOCKET s)
 	unsigned short almHoist = GetHoistAlarm603F();
 	unsigned char almGripL = 0x00, almGripH = 0x00; // 보류
 	unsigned char hb = g_heartbeat.load();
-	//unsigned char driveReady = g_driveReady.load() ? 0x01 : 0x00;
+	unsigned char driveReady = g_driveReady.load() ? 0x01 : 0x00;
 
 	// [수정] 실제 페이로드 바이트 수 계산 (11바이트)
 	// mode(1) + posTravel(1) + posHoist(1) + posGrip(1)
 	// + almTravel(2) + almHoist(2) + almGrip(2) + hb(1)
-	const unsigned char payload_len = 0x0B; // [수정] 0x09 -> 0x0B (11)
+	const unsigned char payload_len = 0x0C; // [수정] 0x09 -> 0x0B (11)
 
 	// [수정] 프레임 총 길이: STX(1) + MsgID(2) + Op(1) + Len(1) + Payload(payload_len) + ETX(1)
 	const size_t frame_capacity = 5 + payload_len + 1;
 
 	// [수정] 고정 크기 대신 계산된 크기로 배열 확보
-	unsigned char frame[5 + 0x0B + 1] = {}; // = 5 + 12 + 1 = 18 바이트
+	unsigned char frame[5 + 0x0C + 1] = {}; // = 5 + 12 + 1 = 18 바이트
 
 	// Header
 	frame[0] = 0x02;       // STX
@@ -2128,10 +2143,10 @@ static void SendPeriodicStateFrame(SOCKET s)
 	// 알람코드(그립) 2 bytes
 	frame[i++] = almGripL;
 	frame[i++] = almGripH;
-	// 운전준비 완료 플래그
-	//frame[i++] = driveReady;
 	// Heartbeat (토글 대상 값)
 	frame[i++] = hb;
+	// 운전준비 완료 플래그
+	frame[i++] = driveReady;
 
 	// ETX
 	frame[i++] = 0x03;
@@ -2513,8 +2528,41 @@ void TcpServerThreadProc()
 		// Periodic thread start
 		g_periodicRun = true;
 		g_heartbeat = 0;
-		std::thread th(PeriodicThreadProc);
-		th.detach();
+
+		{
+			SOCKET sockPeriodic = g_clientSock; // ★ 이 시점의 소켓을 캡쳐해서 사용 (안전)
+			std::thread([sockPeriodic]() mutable {
+
+				auto UpdateDriveReadyIfOk = []() {
+					// 이미 true면 더 볼 필요 없음
+					if (g_driveReady.load(std::memory_order_relaxed)) return;
+
+					unsigned char gripCode = CalcPosGripCode();
+					unsigned char hoistCode = CalcPosHoistCode();
+
+					// 조건 만족 시 driveReady ON
+					if (gripCode != 0x00 && hoistCode == 0x03) {
+						g_driveReady.store(true, std::memory_order_relaxed);
+						AppendLog(L"[INFO] driveReady auto set -> 1 (grip!=0 && hoist==0x03)");
+					}
+					};
+
+				while (g_periodicRun.load(std::memory_order_relaxed) && g_tcpRunning.load()) {
+					if (sockPeriodic == INVALID_SOCKET) break;
+
+					// 1) 상태 기반 driveReady 자동 갱신
+					UpdateDriveReadyIfOk();
+
+					// 2) 주기 프레임 전송
+					SendPeriodicStateFrame(sockPeriodic);
+
+					// 3) 주기(1초)
+					::Sleep(1000);
+				}
+
+				}).detach();
+		}
+		// =========================================================
 
 		char rbuf[512];
 		std::string line;
@@ -2984,36 +3032,40 @@ void TcpServerThreadProc()
 				std::thread([sockReady]() {
 					// 2) 그리퍼 상태 확인
 					unsigned char gcode = CalcPosGripCode(); // 0x00이면 중간(애매한) 상태라고 가정
-
+					bool okGrip = false;
 					wchar_t info[128];
 					swprintf_s(info, L"[ACT] DriveReady: Current GripCode=0x%02X", (unsigned)gcode);
 					AppendLog(info);
 
-					if (gcode == 0x00) {
-						// 2-1) 먼저 Close 쪽으로 정리
-						AppendLog(L"[ACT] DriveReady: Grip ambiguous -> Close then ServoOff");
+					if (HasBox()) {
+						AppendLog(L"[AUTO] HasBox()==true -> Grip Close + ServoOff");
 						DoClose_Compat(g_hDemoWnd);
-						(void)WaitUntil(IsGripperClosedAndIdle, 5000);
+						//DoGripServoOff_Compat(hMain);
+						// ★ TaskState 기반 대기 대신 실제 상태 기반으로 대기(권장)
+						okGrip = WaitUntil(IsGripperClosedAndIdle, 5000);
+						if (!okGrip) {
 
-						// 2-2) Close 상태에서 Servo OFF
-						DoGripServoOff_Compat(g_hDemoWnd);
+							AppendLog(L"[AUTO][WARN] Grip Close or Idle wait FAILED");
+							
+						}
 
-						// 2-3) 박스 보유 여부 체크
-						if (HasBox()) {
-							// 박스 들고 있으면 Close+ServoOff 상태 유지하고 종료
-							AppendLog(L"[ACT] DriveReady: HasBox()==true -> keep Close+ServoOff");
-						}
-						else {
-							// 박스가 없다면 Open 상태로 정리
-							AppendLog(L"[ACT] DriveReady: HasBox()==false -> Open then ServoOff");
-							DoOpen_Compat(g_hDemoWnd);
-							(void)WaitUntil(IsGripperOpenAndIdle, 5000);
-							DoGripServoOff_Compat(g_hDemoWnd);
-						}
+						AppendLog(L"[AUTO] Grip Close -> GripCode=0x02 (Close) forced");
 					}
-					else {
-						// gcode != 0x00 이면 (이미 Open 또는 Close 쪽이라면) 추가 그리퍼 동작 없이 종료
-						AppendLog(L"[ACT] DriveReady: Grip code already non-zero, no extra grip motion");
+					
+					else if (NoBox()) {					
+						AppendLog(L"[AUTO] HasBox()==true -> Grip Open + ServoOff");
+						DoOpen_Compat(g_hDemoWnd);
+						//DoGripServoOff_Compat(hMain);
+						// ★ TaskState 기반 대기 대신 실제 상태 기반으로 대기(권장)
+						okGrip = WaitUntil(IsGripperOpenAndIdle, 5000);
+						if (!okGrip) {
+
+							AppendLog(L"[AUTO][WARN] Grip Open or Idle wait FAILED");
+
+						}
+
+						AppendLog(L"[AUTO] Grip Open -> GripCode=0x01 (Open) forced");
+						
 					}
 
 					// 1) Axis2가 Limit(Up) 상태가 아니면 먼저 Up으로 정리
@@ -3031,8 +3083,11 @@ void TcpServerThreadProc()
 					}
 
 					// 운전 준비 완료 플래그 ON
-					g_driveReady.store(true, std::memory_order_relaxed);
-					AppendLog(L"[INFO] DriveReady sequence complete -> driveReady = 1");
+					if (hcode == 0x03 && gcode != 0x00) {
+						g_driveReady.store(true, std::memory_order_relaxed);
+						AppendLog(L"[INFO] DriveReady sequence complete -> driveReady = 1");
+					}
+					
 
 					g_motionBusy.store(false);
 					}).detach();
@@ -6247,6 +6302,15 @@ static void WaitOneCommCycle()
 	// 통신주기가 1ms 근처라면 10ms 정도면 충분히 여유 있음
 	Sleep(10);
 }
+static void UpdateDriveReadyByState()
+{
+	unsigned char grip = CalcPosGripCode();
+	unsigned char hoist = CalcPosHoistCode();
+
+	if (grip != 0x00 && hoist == 0x03) {
+		g_driveReady.store(true, std::memory_order_relaxed);
+	}
+}
 
 static void AutoStart(HWND hWnd)
 {
@@ -6340,6 +6404,8 @@ static void AutoStart(HWND hWnd)
 
 	PostMessage(hWnd, WM_APP_SHOW_DEMO_MIN, 0, 0);
 
+	DoGripServoOff_Compat(hWnd);
+
 	UpdateEStopUi(hWnd, false);
 	UpdateTcpUiState(hWnd);
 	
@@ -6407,186 +6473,99 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 			// 2) AutoStart 후 TCP 시작
 			StartTcpServer();
-			std::this_thread::sleep_for(std::chrono::seconds(2));
+			std::this_thread::sleep_for(std::chrono::seconds(1));
 
-		// 3) 그리퍼 상태 정리 (HasBox 기준)
-			bool okGrip = false;
-			bool g_code = CalcPosGripCode();
-			if (HasBox() && g_code == 02) {
-				//AppendLog(L"[AUTO] HasBox()==true -> Grip Close + ServoOff");
-				//DoClose_Compat(hMain);
-				DoGripServoOff_Compat(hMain);
-				//okGrip = WaitTaskFinished(TaskId::GripClose, 5000);
-				//if (!okGrip) {
-				//	
-				//	AppendLog(L"[AUTO][WARN] Grip Close or Idle wait FAILED");
-				//	setupOk = false;
-				//}
-				//
-				//SetTaskState(TaskId::GripClose, TaskState::Done);
-				//DoGripServoOff_Compat(hMain);
-				//
-				//AppendLog(L"[AUTO] Grip Close -> GripCode=0x02 (Close) forced");
-				
-			}
-			else if (HasBox() && g_code != 02) {
-				AppendLog(L"[AUTO] HasBox()==true -> Grip Close + ServoOff");
-				DoClose_Compat(hMain);
-				//DoGripServoOff_Compat(hMain);
-				okGrip = WaitTaskFinished(TaskId::GripClose, 5000);
-				if (!okGrip) {
+			//// 3) 그리퍼 상태 정리 (HasBox 기준)
+			//bool okGrip = false;
+			//bool g_code = CalcPosGripCode();
+			//
+			//if (HasBox() && g_code == 0x02) {
+			//	//AppendLog(L"[AUTO] HasBox()==true -> Grip Close + ServoOff");
+			//	//DoClose_Compat(hMain);
+			//	DoGripServoOff_Compat(hMain);
+			//	//okGrip = WaitTaskFinished(TaskId::GripClose, 5000);
+			//	//if (!okGrip) {
+			//	//	
+			//	//	AppendLog(L"[AUTO][WARN] Grip Close or Idle wait FAILED");
+			//	//	setupOk = false;
+			//	//}
+			//	//
+			//	//SetTaskState(TaskId::GripClose, TaskState::Done);
+			//	//DoGripServoOff_Compat(hMain);
+			//	//
+			//	//AppendLog(L"[AUTO] Grip Close -> GripCode=0x02 (Close) forced");
+			//	
+			//}
+			//else if (HasBox() && (g_code == 0x01 || g_code == 0x00)) {
+			//	AppendLog(L"[AUTO] HasBox()==true -> Grip Close + ServoOff");
+			//	DoClose_Compat(hMain);
+			//	//DoGripServoOff_Compat(hMain);
+			//	okGrip = WaitTaskFinished(TaskId::GripClose, 5000);
+			//	if (!okGrip) {
 
-					AppendLog(L"[AUTO][WARN] Grip Close or Idle wait FAILED");
-					setupOk = false;
-				}
+			//		AppendLog(L"[AUTO][WARN] Grip Close or Idle wait FAILED");
+			//		setupOk = false;
+			//	}
 
-				
-				//DoGripServoOff_Compat(hMain);
-				//SetTaskState(TaskId::GripClose, TaskState::Done);
-				AppendLog(L"[AUTO] Grip Close -> GripCode=0x02 (Close) forced");
-			}
-			else if(NoBox() && g_code != 01){
-				AppendLog(L"[AUTO] HasBox()==false -> Grip Open + ServoOff");
-				DoOpen_Compat(hMain);
-				okGrip = WaitTaskFinished(TaskId::GripOpen, 5000);
-				if (!okGrip) {
-					
-					AppendLog(L"[AUTO][WARN] Grip Open or Idle wait FAILED");
-					setupOk = false;
-				}
-				//DoGripServoOff_Compat(hMain);
-				//SetTaskState(TaskId::GripOpen, TaskState::Done);
-				
-				
-				AppendLog(L"[AUTO] Grip Open -> GripCode=0x01 (Open) forced");
-				
-			}
-			else if(NoBox() && g_code == 01){
-				DoGripServoOff_Compat(hMain);
-				
-				//SetTaskState(TaskId::GripOpen, TaskState::Done);
-				
+			//	
+			//	//DoGripServoOff_Compat(hMain);
+			//	//SetTaskState(TaskId::GripClose, TaskState::Done);
+			//	AppendLog(L"[AUTO] Grip Close -> GripCode=0x02 (Close) forced");
+			//}
+			//else if(NoBox() && (g_code == 0x02 || g_code == 0x00)){
+			//	AppendLog(L"[AUTO] HasBox()==false -> Grip Open + ServoOff");
+			//	DoOpen_Compat(hMain);
+			//	okGrip = WaitTaskFinished(TaskId::GripOpen, 5000);
+			//	if (!okGrip) {
+			//		
+			//		AppendLog(L"[AUTO][WARN] Grip Open or Idle wait FAILED");
+			//		setupOk = false;
+			//	}
+			//	//DoGripServoOff_Compat(hMain);
+			//	//SetTaskState(TaskId::GripOpen, TaskState::Done);
+			//	
+			//	
+			//	AppendLog(L"[AUTO] Grip Open -> GripCode=0x01 (Open) forced");
+			//	
+			//}
+			//else if (NoBox() && g_code == 0x00) {
 
-				AppendLog(L"[AUTO] Grip Open -> GripCode=0x01 (Open) forced");
-			}
+			//	DoClose_Compat(hMain);
+
+			//	// Close 상태(0x02)로 실제 판정될 때까지 기다림
+			//	bool closed = WaitUntil([]() { return CalcPosGripCode() == 0x02; }, 5000);
+			//	
+			//	// ★ 여기서 5초 대기(카운트)
+			//	(void)WaitUntil([]() { return false; }, 5000);
+
+			//	unsigned char codeAfterClose = CalcPosGripCode();
+			//	bool nobox = !HasBox();
+			//	if (nobox && codeAfterClose != 0x01) {
+			//		DoOpen_Compat(hMain);
+			//		(void)WaitUntil([]() { return CalcPosGripCode() == 0x01; }, 5000);
+			//	}
+			//}
+
+			//else if(NoBox() && g_code == 0x01){
+			//	DoGripServoOff_Compat(hMain);
+			//	
+			//	//SetTaskState(TaskId::GripOpen, TaskState::Done);
+			//	
+
+			//	AppendLog(L"[AUTO] Grip Open -> GripCode=0x01 (Open) forced");
+			//}
+			//std::this_thread::sleep_for(std::chrono::seconds(1));
+
 			MessageBox(
 						hMain,
 						TEXT("초기 세팅이 정상적으로 완료되었습니다."),
 						TEXT("초기 세팅"),
 						MB_OK | MB_ICONINFORMATION
 					);
-			//std::this_thread::sleep_for(std::chrono::seconds(2));
-			//// 4) HasBox 상관없이 위치 정리 로직
-			//if (!IsAxis2LimitOn()) {
-			//	AppendLog(L"[AUTO] Axis2 limit OFF -> Move Axis2 to -1000 with DO11");
-
-			//	// 1) Axis2를 -1000으로 이동 (직접 프로파일 명령 사용)
-			//	//ToggleDO_HW(11, true, hMain);
-
-			//	bool started = StartAbsMoveWithProfile(
-			//		2,          // axis
-			//		-1000,      // target position
-			//		3000.0,     // velocity
-			//		1000.0,     // tAcc (ms)
-			//		1000.0      // tDec (ms)
-			//	);
-
-			//	bool okAxis2 = false;
-			//	if (started) {
-			//		okAxis2 = WaitUntil(IsAxis2LimitOn, 10000);
-			//	}
-			//	else {
-			//		AppendLog(L"[AUTO][WARN] StartAbsMoveWithProfile(axis2) FAILED");
-			//	}
-
-			//	
-
-			//	if (!started || !okAxis2) {
-			//		AppendLog(L"[AUTO][WARN] Axis2 move to -1000 FAILED or TIMEOUT");
-			//		setupOk = false;
-			//	}
-			//	else {
-			//		AppendLog(L"[AUTO] Axis2 move to -1000 DONE");
-			//		ToggleDO_HW(11, false, hMain);
-			//	}
-
-			//	// 2) 다시 바코드 위치 확인 (주행 위치)
-			//	//unsigned char code = CalcPosTravelCode(); // 0x01 = Load(476774)
-
-			//	//if (code == 0x01) {
-			//	//	AppendLog(L"[AUTO] After Axis2 move: Travel at Load(476774) -> no travel move");
-			//	//}
-			//	//else {
-			//	//	AppendLog(L"[AUTO] After Axis2 move: not at Load -> GO_Conveyor() with DO11");
-
-			//	//	//ToggleDO_HW(11, true, hMain);
-
-			//	//	GO_Conveyor();
-			//	//	bool okConv = WaitTaskFinished(TaskId::GoConveyor, 30000);
-
-			//	//	AppendLog(okConv
-			//	//		? L"[AUTO] GO_Conveyor DONE"
-			//	//		: L"[AUTO][WARN] GO_Conveyor FAILED or TIMEOUT");
-
-			//	//	if (!okConv) {
-			//	//		setupOk = false;
-			//	//	}
-
-			//	//	//ToggleDO_HW(11, false, hMain);
-			//	//}
-			//}
-			//else {
-			//	AppendLog(L"[AUTO] Axis2 limit ON -> check travel barcode");
-			//	ToggleDO_HW(11, false, hMain);
-
-			//	//unsigned char code = CalcPosTravelCode(); // 0x01 = Load(476774), 0x02 = Unload(491332), etc.
-
-			//	//if (code == 0x01) {
-			//	//	// 이미 Load 위치(476774) → 주행 안 함
-			//	//	AppendLog(L"[AUTO] Travel at Load(476774) -> no travel move");
-			//	//}
-			//	//else {
-			//	//	// Limit ON인데 Load 위치가 아니면 Conveyor 위치로 이동
-			//	//	AppendLog(L"[AUTO] Axis2 limit ON & not at Load -> GO_Conveyor() with DO11");
-
-			//	//	// 축 동작 시작: DO11 ON
-			//	//	//ToggleDO_HW(11, true, hMain);
-
-			//	//	GO_Conveyor();
-			//	//	bool okConv = WaitTaskFinished(TaskId::GoConveyor, 30000);
-
-			//	//	AppendLog(okConv
-			//	//		? L"[AUTO] GO_Conveyor DONE"
-			//	//		: L"[AUTO][WARN] GO_Conveyor FAILED or TIMEOUT");
-
-			//	//	if (!okConv) {
-			//	//		setupOk = false;
-			//	//	}
-
-			//		// 동작 종료: DO11 OFF
-			//		//ToggleDO_HW(11, false, hMain);
-			//	//}
-			//}
-
-			//// 5) 전체 초기 세팅 완료 메시지 (성공/실패 분기)
-			//if (setupOk) {
-			//	MessageBox(
-			//		hMain,
-			//		TEXT("초기 세팅이 정상적으로 완료되었습니다."),
-			//		TEXT("초기 세팅"),
-			//		MB_OK | MB_ICONINFORMATION
-			//	);
-			//}
-			//else {
-			//	MessageBox(
-			//		hMain,
-			//		TEXT("초기 세팅 중 일부 단계에서 오류가 발생했습니다.\n로그를 확인해 주세요."),
-			//		TEXT("초기 세팅 오류"),
-			//		MB_OK | MB_ICONWARNING
-			//	);
-			//}
+			
 
 		}, hWnd).detach();
+		
 
 	}
 	return 0;
