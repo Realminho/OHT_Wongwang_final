@@ -1227,7 +1227,7 @@ static const TCHAR* g_DOFuncNames[16] = {
     _T("Open"),     // 8
     _T("Close"),    // 9
     _T("STO"),      // 10
-    _T("None"),     // 11
+    _T("LED"),     // 11
     _T("None"),     // 12
     _T("None"),     // 13
     nullptr,        // 14
