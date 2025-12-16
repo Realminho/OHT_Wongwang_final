@@ -6406,8 +6406,6 @@ static void AutoStart(HWND hWnd)
 
 	PostMessage(hWnd, WM_APP_SHOW_DEMO_MIN, 0, 0);
 
-	DoGripServoOff_Compat(hWnd);
-
 	UpdateEStopUi(hWnd, false);
 	UpdateTcpUiState(hWnd);
 	
@@ -6472,6 +6470,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			// 1) UI/서비스 준비 시간
 			std::this_thread::sleep_for(std::chrono::seconds(1));
 			AutoStart(hMain);
+
+			std::this_thread::sleep_for(std::chrono::seconds(1));
+			DoGripServoOff_Compat(hMain);
 
 			// 2) AutoStart 후 TCP 시작
 			StartTcpServer();
