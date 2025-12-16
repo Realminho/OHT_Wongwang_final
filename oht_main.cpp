@@ -5458,7 +5458,8 @@ struct HybridBarcodeState
 	std::atomic<bool> inCorr{ false };
 	std::atomic<bool> finalSnapSent{ false }; // one-shot final command flag
 
-	int axis = 0;
+	int bcaxis = 0;
+	int moveaxis = 1;
 	long long targetBarcodeAbs = 0;   // absolute barcode(6063) target
 	long long targetBarcodeRel = 0;   // relative barcode to current 6063
 	long long targetMotorPulse = 0;   // pulses for targetBarcodeRel (precomputed at Start)
@@ -5502,7 +5503,7 @@ HybridBarcodeState g_hbc;
 // =====================================================
 static bool Bc_ReadSelectedAxis_6063(int& outVal)
 {
-	int axis = g_hbc.axis;
+	int axis = g_hbc.bcaxis;
 	if (axis < 0 || axis >= 4) return false;
 	return ReadAxis_TxPDO_6063(kAxisSlaveId[axis], outVal);
 }
@@ -5549,7 +5550,7 @@ void HBC_Start(HWND hWnd)
 	g_hbc.stopDelayActive = false;
 	g_hbc.stopDelayTimer = 0;
 
-	int ax = g_hbc.axis;
+	int ax = g_hbc.moveaxis;
 
 	// Read UI parameters - Main profile
 	g_hbc.mainVel = GetDlgDouble(hWnd, ID_BC_EDIT_VEL, 10000);
@@ -5634,7 +5635,7 @@ void HBC_Poll(HWND hWnd)
 	const long long snapErr = 100;      // snapErr threshold
 	const long long finalCheckErr = 2;  // final check threshold
 
-	int ax = g_hbc.axis;
+	int ax = g_hbc.moveaxis;
 
 	int now6063 = 0;
 	if (!Bc_ReadSelectedAxis_6063(now6063)) return;
@@ -5769,7 +5770,7 @@ LRESULT CALLBACK BarcodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 		SendMessage(hAxis, CB_ADDSTRING, 0, (LPARAM)TEXT("1"));
 		SendMessage(hAxis, CB_ADDSTRING, 0, (LPARAM)TEXT("2"));
 		SendMessage(hAxis, CB_ADDSTRING, 0, (LPARAM)TEXT("3"));
-		SendMessage(hAxis, CB_SETCURSEL, g_hbc.axis, 0);
+		SendMessage(hAxis, CB_SETCURSEL, 1, 0);
 
 		// NOW(6063)
 		CreateWindow(TEXT("STATIC"), TEXT("Now(6063)"),
@@ -5935,20 +5936,21 @@ LRESULT CALLBACK BarcodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 		if (id == ID_BC_COMBO_AXIS && HIWORD(wParam) == CBN_SELCHANGE)
 		{
-			g_hbc.axis = (int)SendMessage((HWND)lParam, CB_GETCURSEL, 0, 0);
+			g_hbc.moveaxis = (int)SendMessage((HWND)lParam, CB_GETCURSEL, 0, 0);
+			g_hbc.bcaxis = 0;
 			return 0;
 		}
 
 		if (id == ID_BC_BTN_SERVO_ON)
 		{
-			EnsureServoOn(g_hbc.axis);
-			EnsurePosModeNoStop(g_hbc.axis);
+			EnsureServoOn(g_hbc.moveaxis);
+			EnsurePosModeNoStop(g_hbc.moveaxis);
 			return 0;
 		}
 
 		if (id == ID_BC_BTN_SERVO_OFF)
 		{
-			g_cm.axisControl->SetServoOn(g_hbc.axis, 0);
+			g_cm.axisControl->SetServoOn(g_hbc.moveaxis, 0);
 			return 0;
 		}
 
@@ -5968,7 +5970,7 @@ LRESULT CALLBACK BarcodeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 			g_hbc.stopDelayActive = false;
 			g_hbc.stopDelayTimer = 0;
 
-			StopAxis(g_hbc.axis);
+			StopAxis(g_hbc.moveaxis);
 			return 0;
 		}
 		return 0;
@@ -6350,8 +6352,8 @@ static void AutoStart(HWND hWnd)
 	}*/
 
 	// Servo ON
-	EnsureServoOn(0);
-	EnsurePosModeNoStop(0);
+	EnsureServoOn(1);
+	EnsurePosModeNoStop(1);
 
 	//// 5초 대기
 	//std::this_thread::sleep_for(std::chrono::seconds(5));

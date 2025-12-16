@@ -148,9 +148,10 @@ void ResetAllTaskStates() {
 // Barcode follower (기존 유지)
 // =======================================
 struct BarcodeParams {
-    int axis = 0;
+    int bcAxis = 0;      // ✅ 6063 읽는 축 (0번)
+    int moveAxis = 1;    // ✅ 실제 주행 축 (1번)
     long long targetBarcodeAbs;
-    double mainVel = 30000.0;
+    double mainVel = 10000.0;
     double mainAcc = 1000.0;
     double mainDec = 1000.0;
     double corrVel = 1000.0;
@@ -174,8 +175,8 @@ public:
     }
     void Stop() {
         running_ = false;
-        if (params_.axis >= 0 && params_.axis < 4) {
-            StopAxis(params_.axis);
+        if (params_.moveAxis >= 0 && params_.moveAxis < 4) {
+            StopAxis(params_.moveAxis);
         }
     }
     bool IsRunning() const { return running_.load(); }
@@ -216,15 +217,17 @@ private:
         StartAbsMoveWithProfile(axis, absTarget, vpps, a_ms, d_ms);
     }
     void ThreadProc() {
-        const int ax = params_.axis;
-        if (!g_commStarted || ax < 0 || ax >= 4) { SetTaskState(reportTask_, TaskState::Failed); running_ = false; return; }
-        if (!EnsureServoOn(ax) || !EnsurePosModeNoStop(ax)) { SetTaskState(reportTask_, TaskState::Failed); running_ = false; return; }
+        const int bcAx = params_.bcAxis;       // ✅ 바코드 읽기
+        const int mvAx = params_.moveAxis;     // ✅ 모션 주행
+
+        if (!g_commStarted || bcAx < 0 || bcAx >= 4 || mvAx < 0 || mvAx >= 4) { SetTaskState(reportTask_, TaskState::Failed); running_ = false; return; }
+        if (!EnsureServoOn(mvAx) || !EnsurePosModeNoStop(mvAx)) { SetTaskState(reportTask_, TaskState::Failed); running_ = false; return; }
         SetTaskState(reportTask_, TaskState::Running);
 
         inCorr_ = false; finalSnapSent_ = false; stopDelayActive_ = false; stopDelayTimer_ = 0;
 
         int now6063 = 0;
-        if (!Read6063Now(ax, now6063)) { SetTaskState(reportTask_, TaskState::Failed); running_ = false; return; }
+        if (!Read6063Now(bcAx, now6063)) { SetTaskState(reportTask_, TaskState::Failed); running_ = false; return; }
 
         const long long targetBarcodeAbs = params_.targetBarcodeAbs;
         HbcSnapshot snap{ params_.gear, params_.wheelDia, params_.motorCpr, params_.bcMmPerCnt };
@@ -233,16 +236,16 @@ private:
 
         CoreMotionStatus st{};
         g_cm.GetStatus(&st);
-        long long curPos = (long long)st.axesStatus[ax].actualPos;
+        long long curPos = (long long)st.axesStatus[mvAx].actualPos;
         long long firstTarget = curPos + targetMotorPulse;
-        IssueAbsWithProfile(ax, firstTarget, params_.mainVel, params_.mainAcc, params_.mainDec);
+        IssueAbsWithProfile(mvAx, firstTarget, params_.mainVel, params_.mainAcc, params_.mainDec);
 
         int startBcErr = ComputeAutoStartErr(params_.mainVel);
         const int deadband = params_.deadband;
         bool completed = false;
 
         while (running_.load()) {
-            if (!Read6063Now(ax, now6063)) { completed = false; break; }
+            if (!Read6063Now(bcAx, now6063)) { completed = false; break; }
             long long bcErr = targetBarcodeAbs - (long long)now6063;
             long long eAbs = llabs(bcErr);
             // === deadband 누적 체류 시간 로직 ===
@@ -280,19 +283,19 @@ private:
 
             if (inCorr_) {
                 g_cm.GetStatus(&st);
-                long long cur = (long long)st.axesStatus[ax].actualPos;
-                double actVel = std::fabs(st.axesStatus[ax].actualVelocity);
+                long long cur = (long long)st.axesStatus[mvAx].actualPos;
+                double actVel = std::fabs(st.axesStatus[mvAx].actualVelocity);
                 if (!finalSnapSent_) {
                     long long remainingPulses = HBC_bcToPulses(snap, bcErr);
                     long long absTarget = cur + remainingPulses;
-                    IssueAbsWithProfile(ax, absTarget, params_.corrVel, params_.corrAcc, params_.corrDec);
+                    IssueAbsWithProfile(mvAx, absTarget, params_.corrVel, params_.corrAcc, params_.corrDec);
                     finalSnapSent_ = true;
                 }
                 else {
                     if (actVel < 1.0 && eAbs > kFinalCheckErr) {
                         long long remainingPulses = HBC_bcToPulses(snap, bcErr);
                         long long absTarget = cur + remainingPulses;
-                        IssueAbsWithProfile(ax, absTarget, params_.corrVel, params_.corrAcc, params_.corrDec);
+                        IssueAbsWithProfile(mvAx, absTarget, params_.corrVel, params_.corrAcc, params_.corrDec);
                     }
                 }
             }
@@ -1329,7 +1332,7 @@ bool IsAxis0AtConveyorBarcodeStopped()
 
     CoreMotionStatus st{};
     g_cm.GetStatus(&st);
-    double v = std::fabs(st.axesStatus[0].actualVelocity);
+    double v = std::fabs(st.axesStatus[1].actualVelocity);
     return v <= 1.0;    // 적당한 정지 기준
 }
 
@@ -1340,7 +1343,7 @@ bool IsAxis0AtWorkstationBarcodeStopped()
 
     CoreMotionStatus st{};
     g_cm.GetStatus(&st);
-    double v = std::fabs(st.axesStatus[0].actualVelocity);
+    double v = std::fabs(st.axesStatus[1].actualVelocity);
     return v <= 1.0;
 }
 
@@ -1698,7 +1701,7 @@ void DoUp() {
     int ax = 2; long long tgt = 0;
     // 필드 순서: axis, target, task, velEps, posEps, timeoutMs, treatStoppedAsDone
     MoveMonitorArgs m{ ax, tgt, TaskId::LiftUp, 10.0, 2.0, 15000, true };
-    StartMoveAndMonitor(m, 10000.0, 3000.0, 1500.0);
+    StartMoveAndMonitor(m, 10000.0, 3000.0, 3000.0);
 }
 void DoStopAll(HWND hWnd) {
     DoGripServoOff_Compat(hWnd);
@@ -1713,9 +1716,10 @@ void DoStopAll(HWND hWnd) {
 void Go_Workstation() {
     if (!g_commStarted) { SetTaskState(TaskId::GoWorkstation, TaskState::Failed); return; }
     BarcodeParams p{};
-    p.axis = 0;
+    p.bcAxis = 0;          // ✅ 바코드 읽기축
+    p.moveAxis = 1;        // ✅ 주행축
     p.targetBarcodeAbs = 491332;
-    p.mainVel = 8000.0; p.mainAcc = 1000.0; p.mainDec = 2000.0;
+    p.mainVel = 15000.0; p.mainAcc = 1000.0; p.mainDec = 3000.0;
     p.corrVel = 1000.0; p.corrAcc = 1000.0; p.corrDec = 2000.0;
     p.deadband = 2;
     p.gear = 4.3; p.wheelDia = 70.0; p.motorCpr = 10000.0; p.bcMmPerCnt = 0.1;
@@ -1724,9 +1728,10 @@ void Go_Workstation() {
 void GO_Conveyor() {
     if (!g_commStarted) { SetTaskState(TaskId::GoConveyor, TaskState::Failed); return; }
     BarcodeParams p{};
-    p.axis = 0;
+    p.bcAxis = 0;          // ✅ 바코드 읽기축
+    p.moveAxis = 1;        // ✅ 주행축
     p.targetBarcodeAbs = 476774;
-    p.mainVel = 8000.0; p.mainAcc = 1000.0; p.mainDec = 2000.0;
+    p.mainVel = 15000.0; p.mainAcc = 1000.0; p.mainDec = 3000.0;
     p.corrVel = 1000.0; p.corrAcc = 1000.0; p.corrDec = 2000.0;
     p.deadband = 2;
     p.gear = 4.3; p.wheelDia = 70.0; p.motorCpr = 10000.0; p.bcMmPerCnt = 0.1;
@@ -2061,6 +2066,7 @@ void StartDemoLoad()
 
         // 2. 그리퍼 Close (박스 잡기)
         if (ok) {
+			DoGripServoOff_Compat(g_hDemoWnd); // Servo ON
             DoClose_Compat(g_hDemoWnd);
             // Load의 목적은 "박스를 잡는 것"이므로 HasBox()를 기준으로 대기
             if (!WaitUntil(HasBox, 5000) || !WaitUntil(IsGripperClosedAndIdle, 5000))
@@ -2158,6 +2164,7 @@ void StartDemoUnload()
 
         // 3. 그리퍼 Open (박스 내려놓기)
         if (ok) {
+			DoGripServoOff_Compat(g_hDemoWnd); // Servo ON
             DoOpen_Compat(g_hDemoWnd);
             // Unload 목적: "박스 내려놓고 더 이상 들고 있지 않음" → NoBox() 기준
             if (!WaitUntil(NoBox, 5000) || !WaitUntil(IsGripperOpenAndIdle, 5000))
