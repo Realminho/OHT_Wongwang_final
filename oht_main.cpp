@@ -1970,6 +1970,18 @@ std::atomic<bool> g_periodicRun{ false };
 std::thread g_periodicThread;
 std::atomic<unsigned char> g_heartbeat{ 0 };
 
+// Demo alarm: 1 byte (0x00 = none). Latched until cleared.
+std::atomic<unsigned char> g_demoAlarm{ 0x00 };
+
+// (선택) 첫 에러만 잡고 싶으면 이렇게 쓰는 함수
+static inline void LatchDemoAlarm(unsigned char code)
+{
+	if (code == 0x00) return;
+	unsigned char cur = g_demoAlarm.load(std::memory_order_relaxed);
+	if (cur == 0x00) g_demoAlarm.store(code, std::memory_order_relaxed);
+}
+
+
 // 운전 준비 완료 플래그 (주기 프레임에서 사용)
 std::atomic<bool> g_driveReady{ false };
 
@@ -2104,6 +2116,7 @@ static void SendPeriodicStateFrame(SOCKET s)
 	unsigned char posTravel = CalcPosTravelCode();
 	unsigned char posHoist = CalcPosHoistCode();
 	unsigned char posGrip = CalcPosGripCode(); // 보류
+	unsigned char demoAlm = g_demoAlarm.load(std::memory_order_relaxed); // ★ NEW (1 byte)
 	unsigned short almTravel = GetTravelAlarm603F();
 	unsigned short almHoist = GetHoistAlarm603F();
 	unsigned char almGripL = 0x00, almGripH = 0x00; // 보류
@@ -2113,13 +2126,13 @@ static void SendPeriodicStateFrame(SOCKET s)
 	// [수정] 실제 페이로드 바이트 수 계산 (11바이트)
 	// mode(1) + posTravel(1) + posHoist(1) + posGrip(1)
 	// + almTravel(2) + almHoist(2) + almGrip(2) + hb(1)
-	const unsigned char payload_len = 0x0C; // [수정] 0x09 -> 0x0B (11)
+	const unsigned char payload_len = 0x0D; // [수정] 0x09 -> 0x0B (11)
 
 	// [수정] 프레임 총 길이: STX(1) + MsgID(2) + Op(1) + Len(1) + Payload(payload_len) + ETX(1)
 	const size_t frame_capacity = 5 + payload_len + 1;
 
 	// [수정] 고정 크기 대신 계산된 크기로 배열 확보
-	unsigned char frame[5 + 0x0C + 1] = {}; // = 5 + 12 + 1 = 18 바이트
+	unsigned char frame[5 + 0x0D + 1] = {}; // = 5 + 12 + 1 = 18 바이트
 
 	// Header
 	frame[0] = 0x02;       // STX
@@ -2134,6 +2147,7 @@ static void SendPeriodicStateFrame(SOCKET s)
 	frame[i++] = posTravel;
 	frame[i++] = posHoist;
 	frame[i++] = posGrip;
+	
 	// 알람코드(주행) 2 bytes (LSB, MSB)
 	frame[i++] = (unsigned char)(almTravel & 0xFF);
 	frame[i++] = (unsigned char)((almTravel >> 8) & 0xFF);
@@ -2147,6 +2161,8 @@ static void SendPeriodicStateFrame(SOCKET s)
 	frame[i++] = hb;
 	// 운전준비 완료 플래그
 	frame[i++] = driveReady;
+	// ★ NEW: demoAlarm 1 byte 먼저 추가
+	frame[i++] = demoAlm;
 
 	// ETX
 	frame[i++] = 0x03;
@@ -2746,6 +2762,7 @@ void TcpServerThreadProc()
 
 				// 운전 준비 플래그도 리셋
 				g_driveReady.store(false, std::memory_order_relaxed);
+				g_demoAlarm.store(0x00, std::memory_order_relaxed); // ★ NEW
 
 				return true;
 

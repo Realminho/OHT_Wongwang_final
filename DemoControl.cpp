@@ -30,6 +30,54 @@ extern int  TimeMsToAcc(double vel_cnt_per_s, double t_ms);
 extern bool StartAbsMoveWithProfile(int axis, long long target, double vpps, double tAcc, double tDec);
 extern void StopAxis(int axis);
 
+extern std::atomic<unsigned char> g_demoAlarm;
+
+// 첫 에러만 유지(라치)하고 싶으면 이 헬퍼도 같이 쓰자
+static inline void LatchDemoAlarm(unsigned char code)
+{
+    if (code == 0x00) return;
+    unsigned char cur = g_demoAlarm.load(std::memory_order_relaxed);
+    if (cur == 0x00) g_demoAlarm.store(code, std::memory_order_relaxed);
+}
+static inline void ClearDemoAlarm()
+{
+    g_demoAlarm.store(0x00, std::memory_order_relaxed);
+}
+
+// 0x00 = 정상(알람 없음)
+enum : unsigned char
+{
+    DEMO_ALM_NONE = 0x00,
+
+    // -------- DemoLoad (0x10~0x1F)
+    DEMO_ALM_LOAD_PRECOND_FAIL = 0x10,
+    DEMO_ALM_LOAD_GO_CONVEYOR_TIMEOUT = 0x11,
+    DEMO_ALM_LOAD_CONVEYORDOWN_TIMEOUT = 0x12,
+    DEMO_ALM_LOAD_GRIP_CLOSE_TIMEOUT = 0x13,
+    DEMO_ALM_LOAD_BOX_NOT_CAUGHT = 0x14, // Close 했는데 HasBox 안 됨
+    DEMO_ALM_LOAD_UP_TIMEOUT = 0x15,
+    DEMO_ALM_LOAD_ABORTED_OR_STOP = 0x16,
+    DEMO_ALM_LOAD_COMM_NOT_STARTED = 0x17,
+    // (선택) 복구 중 실패도 코드 찍고 싶으면
+    DEMO_ALM_LOAD_REC_OPEN_TIMEOUT = 0x18,
+    DEMO_ALM_LOAD_REC_UP_TIMEOUT = 0x19,
+
+    // -------- DemoUnload (0x20~0x2F)
+    DEMO_ALM_UNLOAD_PRECOND_FAIL = 0x20,
+    DEMO_ALM_UNLOAD_GO_WORK_TIMEOUT = 0x21,
+    DEMO_ALM_UNLOAD_WORKDOWN_TIMEOUT = 0x22,
+    DEMO_ALM_UNLOAD_GRIP_OPEN_TIMEOUT = 0x23,
+    DEMO_ALM_UNLOAD_BOX_NOT_RELEASED = 0x24, // Open 했는데 NoBox 안 됨
+    DEMO_ALM_UNLOAD_UP_TIMEOUT = 0x25,
+    DEMO_ALM_UNLOAD_GO_CONVEYOR_TIMEOUT = 0x26,
+    DEMO_ALM_UNLOAD_ABORTED_OR_STOP = 0x27,
+    DEMO_ALM_UNLOAD_COMM_NOT_STARTED = 0x28,
+
+    // -------- 공통(0xF0~)
+    DEMO_ALM_UNKNOWN = 0xF0
+};
+
+
 // ========== EtherCAT 0x6063 읽기 ==========
 extern bool ReadAxis_TxPDO_6063(int slaveId, int& outVal);
 extern const int kAxisSlaveId[4] = { 0, 1, 2, 3 };
@@ -1988,7 +2036,7 @@ void StartDemoWorkWithoutBox()
 // Load 시퀀스: Conveyor → Workstation
 void StartDemoLoad()
 {
-    if (!g_commStarted) { SetTaskState(TaskId::DemoLoad, TaskState::Failed); return; }
+    if (!g_commStarted) { SetTaskState(TaskId::DemoLoad, TaskState::Failed); LatchDemoAlarm(DEMO_ALM_LOAD_COMM_NOT_STARTED); return; }
     if (g_taskStatus[(int)TaskId::DemoLoad].state.load() == TaskState::Running) return;
 
     // ★ 시퀀스 시작 전 상태 체크:
@@ -1998,6 +2046,7 @@ void StartDemoLoad()
     if (!CheckDemoLoadPreconditions()) {
         // 일단 Load 시퀀스 자체는 실패로 표시
         SetTaskState(TaskId::DemoLoad, TaskState::Failed);
+        LatchDemoAlarm(DEMO_ALM_LOAD_PRECOND_FAIL);
 
         // 1) Axis2가 Limit(Up) 상태가 아니면 먼저 Up으로 정리
         if (!IsAxis2LimitOn()) {
@@ -2048,6 +2097,7 @@ void StartDemoLoad()
                 GO_Conveyor();
                 if (!WaitUntil(IsAxis0AtConveyorBarcodeStopped, 30000)) {
                     ok = false;
+                    LatchDemoAlarm(DEMO_ALM_LOAD_GO_CONVEYOR_TIMEOUT);
                 }
 				Sleep(1000);
             }
@@ -2057,8 +2107,10 @@ void StartDemoLoad()
         if (ok) {
             ConveyorDown();
             // 축2가 ConveyorDown 위치에 도달할 때까지 대기
-            if (!WaitUntil(IsAxis2Conveyordown, 20000))
+            if (!WaitUntil(IsAxis2Conveyordown, 20000)) {
                 ok = false;
+                LatchDemoAlarm(DEMO_ALM_LOAD_CONVEYORDOWN_TIMEOUT);
+            }
         }
 
         // 2. 그리퍼 Close (박스 잡기)
@@ -2066,24 +2118,44 @@ void StartDemoLoad()
 			DoGripServoOff_Compat(g_hDemoWnd); // Servo ON
             Sleep(500);
             DoClose_Compat(g_hDemoWnd);
+
             // Load의 목적은 "박스를 잡는 것"이므로 HasBox()를 기준으로 대기
-            if (!WaitUntil(HasBox, 5000) || !WaitUntil(IsGripperClosedAndIdle, 5000)) {
+            bool gotBox = WaitUntil(HasBox, 5000);
+            bool closedIdle = WaitUntil(IsGripperClosedAndIdle, 5000);
+
+            if (!gotBox || !closedIdle) {
                 ok = false;
-                if(!HasBox()) {
+
+                // ★ 에러코드만 세팅 (동작은 그대로)
+                // 우선순위: HasBox 실패가 더 근본 원인인 경우가 많으니 먼저 라치
+                if (!gotBox) {
+                    LatchDemoAlarm(DEMO_ALM_LOAD_BOX_NOT_CAUGHT);
+                }
+                else if (!closedIdle) {
+                    LatchDemoAlarm(DEMO_ALM_LOAD_GRIP_CLOSE_TIMEOUT);
+                }
+
+                // ---- 이하 기존 동작 그대로 ----
+                if (!HasBox()) {
                     bool Ok = true;
+
                     // 박스가 없다면 Open 상태로 정리
                     DoOpen_Compat(g_hDemoWnd);
                     if (!WaitUntil(IsGripperOpenAndIdle, 5000)) {
-						Ok = false;
+                        Ok = false;
+                        // (선택) 복구 실패도 찍고 싶으면. 첫 에러만 유지라면 Latch라 덮어쓰지 않음
+                        LatchDemoAlarm(DEMO_ALM_LOAD_REC_OPEN_TIMEOUT);
                     }
+
                     if (Ok) {
                         DoUp();
-                        if (!WaitUntil(IsAxis2Up, 20000))
+                        if (!WaitUntil(IsAxis2Up, 20000)) {
                             Ok = false;
+                            // (선택)
+                            LatchDemoAlarm(DEMO_ALM_LOAD_REC_UP_TIMEOUT);
+                        }
                     }
-
                 }
-
             }
 
         }
@@ -2091,8 +2163,10 @@ void StartDemoLoad()
         // 3. 축2 Up
         if (ok) {
             DoUp();
-            if (!WaitUntil(IsAxis2Up, 20000))
+            if (!WaitUntil(IsAxis2Up, 20000)) {
                 ok = false;
+                LatchDemoAlarm(DEMO_ALM_LOAD_UP_TIMEOUT);
+            }
         }
 
         Sleep(1000);
@@ -2104,12 +2178,13 @@ void StartDemoLoad()
 // Unload 시퀀스: Workstation → Conveyor
 void StartDemoUnload()
 {
-    if (!g_commStarted) { SetTaskState(TaskId::DemoUnload, TaskState::Failed); return; }
+    if (!g_commStarted) { SetTaskState(TaskId::DemoUnload, TaskState::Failed); LatchDemoAlarm(DEMO_ALM_UNLOAD_COMM_NOT_STARTED); return; }
     if (g_taskStatus[(int)TaskId::DemoUnload].state.load() == TaskState::Running) return;
 
     if (!CheckDemoUnloadPreconditions()) {
         // 일단 Load 시퀀스 자체는 실패로 표시
         SetTaskState(TaskId::DemoUnload, TaskState::Failed);
+        LatchDemoAlarm(DEMO_ALM_UNLOAD_PRECOND_FAIL);
 
         // 1) Axis2가 Limit(Up) 상태가 아니면 먼저 Up으로 정리
         if (!IsAxis2LimitOn()) {
@@ -2158,8 +2233,10 @@ void StartDemoUnload()
             }
             else {
                 Go_Workstation();
-                if (!WaitUntil(IsAxis0AtWorkstationBarcodeStopped, 30000))
+                if (!WaitUntil(IsAxis0AtWorkstationBarcodeStopped, 30000)) {
                     ok = false;
+                    LatchDemoAlarm(DEMO_ALM_UNLOAD_GO_WORK_TIMEOUT);
+                }
             }
             Sleep(1000);
         }
@@ -2168,8 +2245,10 @@ void StartDemoUnload()
         // 2. WorkDown (작업 위치로 하강)
         if (ok) {
             WorkDown();
-            if (!WaitUntil(IsAxis2Workdown, 20000))
+            if (!WaitUntil(IsAxis2Workdown, 20000)) {
                 ok = false;
+                LatchDemoAlarm(DEMO_ALM_UNLOAD_WORKDOWN_TIMEOUT);
+            }
         }
 
         // 3. 그리퍼 Open (박스 내려놓기)
@@ -2177,24 +2256,36 @@ void StartDemoUnload()
 			DoGripServoOff_Compat(g_hDemoWnd); // Servo ON
             Sleep(500);
             DoOpen_Compat(g_hDemoWnd);
-            // Unload 목적: "박스 내려놓고 더 이상 들고 있지 않음" → NoBox() 기준
-            if (!WaitUntil(NoBox, 5000) || !WaitUntil(IsGripperOpenAndIdle, 5000))
+            bool released = WaitUntil(NoBox, 5000);
+            bool openIdle = WaitUntil(IsGripperOpenAndIdle, 5000);
+
+            if (!released) {
                 ok = false;
+                LatchDemoAlarm(DEMO_ALM_UNLOAD_BOX_NOT_RELEASED);
+            }
+            else if (!openIdle) {
+                ok = false;
+                LatchDemoAlarm(DEMO_ALM_UNLOAD_GRIP_OPEN_TIMEOUT);
+            }
         }
 
 
         // 4. 축2 Up
         if (ok) {
             DoUp();
-            if (!WaitUntil(IsAxis2Up, 20000))
+            if (!WaitUntil(IsAxis2Up, 20000)) {
                 ok = false;
+                LatchDemoAlarm(DEMO_ALM_UNLOAD_UP_TIMEOUT);
+            }
         }
 
         // 5. Conveyor 위치로 이동
         if (ok) {
             GO_Conveyor();
-            if (!WaitUntil(IsAxis0AtConveyorBarcodeStopped, 30000))
+            if (!WaitUntil(IsAxis0AtConveyorBarcodeStopped, 30000)) {
                 ok = false;
+                LatchDemoAlarm(DEMO_ALM_UNLOAD_GO_CONVEYOR_TIMEOUT);
+            }
         }
         Sleep(1000);
 
