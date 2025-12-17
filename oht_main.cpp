@@ -3075,8 +3075,21 @@ void TcpServerThreadProc()
 
 					if (hcode != 0x03) {
 						AppendLog(L"[ACT] DriveReady: Hoist not UP(0x03) -> DoUp()");
-						DoUp();
-						(void)WaitUntil(IsAxis2Up, 20000);
+						bool started = StartAbsMoveWithProfile(
+							2,          // axis
+							-1000,      // target position
+							3000.0,     // velocity
+							1000.0,     // tAcc (ms)
+							1000.0      // tDec (ms)
+						);
+
+						bool okAxis2 = false;
+						if (started) {
+							okAxis2 = WaitUntil(IsAxis2LimitOn, 10000);
+						}
+						else {
+							AppendLog(L"[AUTO][WARN] StartAbsMoveWithProfile(axis2) FAILED");
+						}
 					}
 					else {
 						AppendLog(L"[ACT] DriveReady: Hoist already UP(0x03)");

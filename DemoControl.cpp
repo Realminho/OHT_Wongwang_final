@@ -2008,7 +2008,7 @@ void StartDemoLoad()
         // 2) 그리퍼 상태 확인
         unsigned char gcode = CalcPosGripCode(); // 0x00이면 중간(애매한) 상태라고 가정
 
-        if (gcode == 0x00) {
+        if (HasBox() && gcode != 0x02) {
 
             // 2-1) 먼저 Close 쪽으로 정리
             DoClose_Compat(g_hDemoWnd);
@@ -2017,22 +2017,19 @@ void StartDemoLoad()
             // 2-2) Close 상태에서 Servo OFF
             DoGripServoOff_Compat(g_hDemoWnd);
 
-            // 2-3) 박스 보유 여부 체크
-            if (HasBox()) {
-                // 박스 들고 있으면 Close+ServoOff 상태 유지하고 종료
-            }
-            else {
-
-                // 박스가 없다면 Open 상태로 정리
-                DoOpen_Compat(g_hDemoWnd);
-                (void)WaitUntil(IsGripperOpenAndIdle, 5000);
-
-                DoGripServoOff_Compat(g_hDemoWnd);
-            }
         }
-        else {
+        else if(HasBox() && gcode == 0x02) {
+            return;
             // gcode != 0x00 이면 (이미 Open 또는 Close 쪽이라면) 추가 그리퍼 동작 없이 종료
 
+        }
+        else if (!HasBox() && gcode != 0x01) {
+            // 2-1) 먼저 Close 쪽으로 정리
+            DoOpen_Compat(g_hDemoWnd);
+            (void)WaitUntil(IsGripperOpenAndIdle, 5000);
+
+            // 2-2) Close 상태에서 Servo OFF
+            DoGripServoOff_Compat(g_hDemoWnd);
         }
 
         // 여기서는 Load 시퀀스를 시작하지 않고 복구만 하고 종료
@@ -2067,10 +2064,28 @@ void StartDemoLoad()
         // 2. 그리퍼 Close (박스 잡기)
         if (ok) {
 			DoGripServoOff_Compat(g_hDemoWnd); // Servo ON
+            Sleep(500);
             DoClose_Compat(g_hDemoWnd);
             // Load의 목적은 "박스를 잡는 것"이므로 HasBox()를 기준으로 대기
-            if (!WaitUntil(HasBox, 5000) || !WaitUntil(IsGripperClosedAndIdle, 5000))
+            if (!WaitUntil(HasBox, 5000) || !WaitUntil(IsGripperClosedAndIdle, 5000)) {
                 ok = false;
+                if(!HasBox()) {
+                    bool Ok = true;
+                    // 박스가 없다면 Open 상태로 정리
+                    DoOpen_Compat(g_hDemoWnd);
+                    if (!WaitUntil(IsGripperOpenAndIdle, 5000)) {
+						Ok = false;
+                    }
+                    if (Ok) {
+                        DoUp();
+                        if (!WaitUntil(IsAxis2Up, 20000))
+                            Ok = false;
+                    }
+
+                }
+
+            }
+
         }
 
         // 3. 축2 Up
@@ -2105,7 +2120,7 @@ void StartDemoUnload()
         // 2) 그리퍼 상태 확인
         unsigned char gcode = CalcPosGripCode(); // 0x00이면 중간(애매한) 상태라고 가정
 
-        if (gcode == 0x00) {
+        if (HasBox() && gcode != 0x02) {
 
             // 2-1) 먼저 Close 쪽으로 정리
             DoClose_Compat(g_hDemoWnd);
@@ -2114,22 +2129,17 @@ void StartDemoUnload()
             // 2-2) Close 상태에서 Servo OFF
             DoGripServoOff_Compat(g_hDemoWnd);
 
-            // 2-3) 박스 보유 여부 체크
-            if (HasBox()) {
-                // 박스 들고 있으면 Close+ServoOff 상태 유지하고 종료
-            }
-            else {
-
-                // 박스가 없다면 Open 상태로 정리
-                DoOpen_Compat(g_hDemoWnd);
-                (void)WaitUntil(IsGripperOpenAndIdle, 5000);
-
-                DoGripServoOff_Compat(g_hDemoWnd);
-            }
+            
         }
-        else {
-            // gcode != 0x00 이면 (이미 Open 또는 Close 쪽이라면) 추가 그리퍼 동작 없이 종료
+        else if(!HasBox() && gcode != 0x01) {
+            // 박스가 없다면 Open 상태로 정리
+            DoOpen_Compat(g_hDemoWnd);
+            (void)WaitUntil(IsGripperOpenAndIdle, 5000);
 
+            DoGripServoOff_Compat(g_hDemoWnd);
+        }
+        else if (!HasBox() && gcode == 0x01) {
+            return;
         }
 
         // 여기서는 Load 시퀀스를 시작하지 않고 복구만 하고 종료
@@ -2165,11 +2175,13 @@ void StartDemoUnload()
         // 3. 그리퍼 Open (박스 내려놓기)
         if (ok) {
 			DoGripServoOff_Compat(g_hDemoWnd); // Servo ON
+            Sleep(500);
             DoOpen_Compat(g_hDemoWnd);
             // Unload 목적: "박스 내려놓고 더 이상 들고 있지 않음" → NoBox() 기준
             if (!WaitUntil(NoBox, 5000) || !WaitUntil(IsGripperOpenAndIdle, 5000))
                 ok = false;
         }
+
 
         // 4. 축2 Up
         if (ok) {
