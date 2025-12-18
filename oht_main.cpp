@@ -1981,6 +1981,38 @@ static inline void LatchDemoAlarm(unsigned char code)
 	if (cur == 0x00) g_demoAlarm.store(code, std::memory_order_relaxed);
 }
 
+static bool IsAxisServoOn(int axis)
+{
+	if (!g_commStarted) return false;
+	g_cm.GetStatus(&g_status);
+
+	// ⚠️ 프로젝트의 status 구조체에 맞게 필드명만 확인해줘.
+	// (servoOn / ampEnabled / driveEnabled 등일 수 있음)
+	return (g_status.axesStatus[axis].servoOn != 0);
+}
+
+enum : unsigned char
+{
+	DEMO_ALM_NONE = 0x00,
+
+	// ---- TRAVEL(0x2A): 0x40~0x4F
+	DEMO_ALM_TRAVEL_INTERLOCK_FAIL = 0x40,
+	DEMO_ALM_TRAVEL_BUSY = 0x41,
+	DEMO_ALM_TRAVEL_SERVO1_OFF = 0x42, // ★ Axis1 ServoOn 요구
+	DEMO_ALM_TRAVEL_INVALID_POS = 0x43,
+	DEMO_ALM_TRAVEL_TO_CONVEYOR_TO = 0x44,
+	DEMO_ALM_TRAVEL_TO_WORK_TO = 0x45,
+
+	// ---- HOIST(0x2B): 0x50~0x5F
+	DEMO_ALM_HOIST_INTERLOCK_FAIL = 0x50,
+	DEMO_ALM_HOIST_BUSY = 0x51,
+	DEMO_ALM_HOIST_SERVO2_OFF = 0x52, // ★ Axis2 ServoOn 요구
+	DEMO_ALM_HOIST_INVALID_POS = 0x53,
+	DEMO_ALM_HOIST_CONVEYORDOWN_TO = 0x54,
+	DEMO_ALM_HOIST_WORKDOWN_TO = 0x55,
+	DEMO_ALM_HOIST_UP_TO = 0x56,
+};
+
 
 // 운전 준비 완료 플래그 (주기 프레임에서 사용)
 std::atomic<bool> g_driveReady{ false };
@@ -2461,7 +2493,6 @@ std::atomic<bool> g_motionBusy{ false };
 std::atomic<bool> g_ackLoadDone{ false };
 std::atomic<bool> g_ackUnloadDone{ false };
 
-
 void TcpServerThreadProc()
 {
 	WSADATA wsa{};
@@ -2550,6 +2581,7 @@ void TcpServerThreadProc()
 			std::thread([sockPeriodic]() mutable {
 
 				auto UpdateDriveReadyIfOk = []() {
+					if (g_motionBusy.load(std::memory_order_relaxed)) return;
 					// 이미 true면 더 볼 필요 없음
 					if (g_driveReady.load(std::memory_order_relaxed)) return;
 
@@ -2629,6 +2661,7 @@ void TcpServerThreadProc()
 					if (!okLoad) {
 						AppendLog(L"[WARN] Load sequence timeout or failed");
 						ToggleDO_HW(11, false, nullptr);
+						g_driveReady.store(false, std::memory_order_relaxed); // ★ NEW: 실패하면 0으로 리셋
 						g_motionBusy.store(false);
 						return;
 						// 실패시 Done은 보내지 않음 (현재 정책)
@@ -2694,6 +2727,7 @@ void TcpServerThreadProc()
 					if (!okUnload) {
 						AppendLog(L"[WARN] Unload sequence timeout or failed");
 						ToggleDO_HW(11, false, nullptr);
+						g_driveReady.store(false, std::memory_order_relaxed); // ★ NEW: 실패하면 0으로 리셋
 						g_motionBusy.store(false);
 						return;
 					}
@@ -2737,11 +2771,30 @@ void TcpServerThreadProc()
 				AppendLog(L"[TX] Stop Request ACK sent");
 
 				DoStopAll(nullptr);
-				ToggleDO_HW(11, false, nullptr);
+
+
+
+				
 				AppendLog(L"[ACT] All axes QuickStop executed");
 
 				if (WaitAllAxesStopped(1.0, 10000)) {
 					AppendLog(L"[INFO] All axes stopped (vel <= 1.0, Motioning OFF)");
+
+					// ★ 추가: axis1, axis2 Servo OFF
+					for (int a : { 1, 2 }) {
+						long e = g_cm.axisControl->SetServoOn(a, 0);
+						if (e != ErrorCode::None) {
+							wchar_t msg[128];
+							swprintf_s(msg, L"[WARN] Axis%d Servo OFF FAILED (err=%ld)", a, e);
+							AppendLog(msg);
+						}
+						else {
+							wchar_t msg[128];
+							swprintf_s(msg, L"[ACT] Axis%d Servo OFF OK", a);
+							AppendLog(msg);
+						}
+					}
+					ToggleDO_HW(11, false, nullptr);
 					SendSimpleDone(g_clientSock, 0x29);
 					AppendLog(L"[TX] Stop Done sent");
 					return true;
@@ -2753,6 +2806,8 @@ void TcpServerThreadProc()
 
 				// ---------------- RESET ----------------
 			case 0xFD: // 리셋
+			{
+				ToggleDO_HW(11, false, nullptr);
 				AppendLog(L"[INFO] PLC -> PC : Reset Request");
 				for (int a = 0; a < 4; ++a) {
 					g_cm.axisControl->ClearAmpAlarm(a);
@@ -2764,8 +2819,45 @@ void TcpServerThreadProc()
 				g_driveReady.store(false, std::memory_order_relaxed);
 				g_demoAlarm.store(0x00, std::memory_order_relaxed); // ★ NEW
 
-				return true;
+				// 현재 Servo 상태 확인
+				bool s1 = IsAxisServoOn(1);
+				bool s2 = IsAxisServoOn(2);
 
+				// ★ 둘 다 OFF일 때만: Axis1 ON -> 5초 대기 -> Axis2 ON
+				if (!s1 && !s2) {
+					AppendLog(L"[RESET] Axis1&2 ServoOff -> ServoOn Axis1, wait 5s, then ServoOn Axis2");
+
+					EnsureServoOn(1);
+					EnsurePosModeNoStop(1);
+
+					std::this_thread::sleep_for(std::chrono::seconds(5));
+
+					EnsureServoOn(2);
+					EnsurePosModeNoStop(2);
+				}
+				else {
+					// 그 외에는 OFF된 축만 켜고, 5초 대기는 하지 않음
+					if (!s1) {
+						AppendLog(L"[RESET] Axis1 ServoOff -> ServoOn Axis1 (no 5s wait)");
+						EnsureServoOn(1);
+						EnsurePosModeNoStop(1);
+					}
+					else {
+						AppendLog(L"[RESET] Axis1 already ServoOn -> skip");
+					}
+
+					if (!s2) {
+						AppendLog(L"[RESET] Axis2 ServoOff -> ServoOn Axis2 (no 5s wait)");
+						EnsureServoOn(2);
+						EnsurePosModeNoStop(2);
+					}
+					else {
+						AppendLog(L"[RESET] Axis2 already ServoOn -> skip");
+					}
+				}
+
+				return true;
+			}
 				// ---------------- COMM OPEN ----------------
 			case 0xF0: // Comm Open
 				if (payLen >= 1 && f[5] == 0x01) {
@@ -2783,7 +2875,19 @@ void TcpServerThreadProc()
 				// 인터락 체크
 				if (!CheckInterlockBeforeAxisCommand(0)) {
 					AppendLog(L"[INTERLOCK] Axis0 blocked: Axis2 limit must be ON in Auto");
+					LatchDemoAlarm(DEMO_ALM_TRAVEL_INTERLOCK_FAIL);  // ★ NEW
 					return false;
+				}
+
+				// ★ NEW: Axis1 ServoOn 확인 (아니면 알람만 띄우고 끝)
+				if (!IsAxisServoOn(1)) {
+					AppendLog(L"[ALM] Travel blocked: Axis1 ServoOff -> Please ServoOn Axis1");
+					LatchDemoAlarm(DEMO_ALM_TRAVEL_SERVO1_OFF);
+
+					// PLC가 "수신"은 알게 ACK는 보내는 걸 추천
+					SendSimpleAck(g_clientSock, 0x2A);
+					AppendLog(L"[TX] Travel Position ACK sent (but rejected by ServoOff)");
+					return true; // 프레임 처리 완료(동작은 안 함)
 				}
 
 				unsigned char posNo = (payLen >= 1) ? f[5] : 0;
@@ -2794,6 +2898,7 @@ void TcpServerThreadProc()
 				bool expectedBusy = false;
 				if (!g_motionBusy.compare_exchange_strong(expectedBusy, true)) {
 					AppendLog(L"[BUSY] Travel command ignored: motion already in progress");
+					LatchDemoAlarm(DEMO_ALM_TRAVEL_BUSY); // ★ NEW
 					return false;
 				}
 
@@ -2814,8 +2919,8 @@ void TcpServerThreadProc()
 						AppendLog(okTravel
 							? L"[ACT] Travel Pos1 -> Conveyor DONE"
 							: L"[ACT] Travel Pos1 -> Conveyor FAILED or TIMEOUT");
-						if (okTravel)
-							ToggleDO_HW(11, false, nullptr);
+						if (!okTravel) LatchDemoAlarm(DEMO_ALM_TRAVEL_TO_CONVEYOR_TO); // ★ NEW
+						ToggleDO_HW(11, false, nullptr);
 						break;
 					case 2:
 						AppendLog(L"[ACT] Travel Pos2 -> Workstation");
@@ -2825,8 +2930,8 @@ void TcpServerThreadProc()
 						AppendLog(okTravel
 							? L"[ACT] Travel Pos2 -> Workstation DONE"
 							: L"[ACT] Travel Pos2 -> Workstation FAILED or TIMEOUT");
-						if (okTravel)
-							ToggleDO_HW(11, false, nullptr);
+						if (!okTravel) LatchDemoAlarm(DEMO_ALM_TRAVEL_TO_WORK_TO); // ★ NEW
+						ToggleDO_HW(11, false, nullptr);
 						break;
 					case 3:
 						ToggleDO_HW(11, false, nullptr);
@@ -2836,6 +2941,7 @@ void TcpServerThreadProc()
 					default:
 						ToggleDO_HW(11, false, nullptr);
 						AppendLog(L"[WARN] Travel Position invalid PosNo");
+						LatchDemoAlarm(DEMO_ALM_TRAVEL_INVALID_POS); // ★ NEW
 						okTravel = false;
 						break;
 					}
@@ -2856,7 +2962,18 @@ void TcpServerThreadProc()
 			{
 				if (!CheckInterlockBeforeAxisCommand(2)) {
 					AppendLog(L"[INTERLOCK] Axis2 blocked: Travel must be at Load/Unload in Auto");
+					LatchDemoAlarm(DEMO_ALM_HOIST_INTERLOCK_FAIL); // ★ NEW
 					return false;
+				}
+
+				// ★ NEW: Axis2 ServoOn 확인 (아니면 알람만 띄우고 끝)
+				if (!IsAxisServoOn(2)) {
+					AppendLog(L"[ALM] Hoist blocked: Axis2 ServoOff -> Please ServoOn Axis2");
+					LatchDemoAlarm(DEMO_ALM_HOIST_SERVO2_OFF);
+
+					SendSimpleAck(g_clientSock, 0x2B);
+					AppendLog(L"[TX] Hoist Position ACK sent (but rejected by ServoOff)");
+					return true;
 				}
 
 				unsigned char posNo = (payLen >= 1) ? f[5] : 0;
@@ -2867,6 +2984,7 @@ void TcpServerThreadProc()
 				bool expectedBusy = false;
 				if (!g_motionBusy.compare_exchange_strong(expectedBusy, true)) {
 					AppendLog(L"[BUSY] Hoist command ignored: motion already in progress");
+					LatchDemoAlarm(DEMO_ALM_HOIST_BUSY); // ★ NEW
 					return false;
 				}
 
@@ -2886,8 +3004,8 @@ void TcpServerThreadProc()
 						AppendLog(okHoist
 							? L"[ACT] Hoist Pos1 -> ConveyorDown DONE"
 							: L"[ACT] Hoist Pos1 -> ConveyorDown FAILED or TIMEOUT");
-						if (okHoist)
-							ToggleDO_HW(11, false, nullptr);
+						if (!okHoist) LatchDemoAlarm(DEMO_ALM_HOIST_CONVEYORDOWN_TO); // ★ NEW
+						ToggleDO_HW(11, false, nullptr);
 						break;
 
 					case 2:
@@ -2898,8 +3016,8 @@ void TcpServerThreadProc()
 						AppendLog(okHoist
 							? L"[ACT] Hoist Pos2 -> WorkDown DONE"
 							: L"[ACT] Hoist Pos2 -> WorkDown FAILED or TIMEOUT");
-						if (okHoist)
-							ToggleDO_HW(11, false, nullptr);
+						if (!okHoist) LatchDemoAlarm(DEMO_ALM_HOIST_WORKDOWN_TO); // ★ NEW
+						ToggleDO_HW(11, false, nullptr);
 						break;
 
 					case 3:
@@ -2910,12 +3028,14 @@ void TcpServerThreadProc()
 						AppendLog(okHoist
 							? L"[ACT] Hoist Pos3 -> Up DONE"
 							: L"[ACT] Hoist Pos3 -> Up FAILED or TIMEOUT");
-						if (okHoist)
-							ToggleDO_HW(11, false, nullptr);
+						if (!okHoist) LatchDemoAlarm(DEMO_ALM_HOIST_UP_TO); // ★ NEW
+						ToggleDO_HW(11, false, nullptr);
 						break;
 
 					default:
+						ToggleDO_HW(11, false, nullptr);
 						AppendLog(L"[WARN] Hoist Position invalid PosNo");
+						LatchDemoAlarm(DEMO_ALM_HOIST_INVALID_POS); // ★ NEW
 						okHoist = false;
 						break;
 					}
@@ -2977,7 +3097,8 @@ void TcpServerThreadProc()
 						AppendLog(L"[ACT] Grip Pos1 -> GripOpen");
 						g_gripBusy = true;
 
-
+						DoGripServoOff_Compat(nullptr); // 서보 오프
+						Sleep(100);
 						ToggleDO_HW(11, motioning, nullptr);
 						DoOpen_Compat(nullptr);
 						okGrip = WaitUntil(IsGripperOpenAndIdle, 10000);
@@ -2999,7 +3120,8 @@ void TcpServerThreadProc()
 						AppendLog(L"[ACT] Grip Pos2 -> GripClose");
 						g_gripBusy = true;
 
-
+						DoGripServoOff_Compat(nullptr); // 서보 오프
+						Sleep(100);
 						ToggleDO_HW(11, motioning, nullptr);
 						DoClose_Compat(nullptr);
 						okGrip = WaitUntil(IsGripperClosedAndIdle, 10000);
@@ -3055,34 +3177,41 @@ void TcpServerThreadProc()
 					AppendLog(info);
 
 					if (HasBox()) {
-						AppendLog(L"[AUTO] HasBox()==true -> Grip Close + ServoOff");
-						DoClose_Compat(g_hDemoWnd);
-						//DoGripServoOff_Compat(hMain);
-						// ★ TaskState 기반 대기 대신 실제 상태 기반으로 대기(권장)
-						okGrip = WaitUntil(IsGripperClosedAndIdle, 5000);
-						if (!okGrip) {
-
-							AppendLog(L"[AUTO][WARN] Grip Close or Idle wait FAILED");
-							
+						// ★ NEW: 이미 Close면 스킵
+						if (gcode == 0x02) {
+							AppendLog(L"[SKIP] HasBox()==true and Grip already CLOSED (0x02) -> skip grip action");
+							okGrip = true;
 						}
-
-						AppendLog(L"[AUTO] Grip Close -> GripCode=0x02 (Close) forced");
+						else {
+							AppendLog(L"[AUTO] HasBox()==true -> Grip Close");
+							DoClose_Compat(g_hDemoWnd);
+							okGrip = WaitUntil(IsGripperClosedAndIdle, 5000);
+							if (!okGrip) {
+								AppendLog(L"[AUTO][WARN] Grip Close or Idle wait FAILED");
+							}
+							else {
+								AppendLog(L"[AUTO] Grip Close DONE (Idle)");
+							}
+						}
 					}
 					
 					else if (NoBox()) {					
-						AppendLog(L"[AUTO] HasBox()==true -> Grip Open + ServoOff");
-						DoOpen_Compat(g_hDemoWnd);
-						//DoGripServoOff_Compat(hMain);
-						// ★ TaskState 기반 대기 대신 실제 상태 기반으로 대기(권장)
-						okGrip = WaitUntil(IsGripperOpenAndIdle, 5000);
-						if (!okGrip) {
-
-							AppendLog(L"[AUTO][WARN] Grip Open or Idle wait FAILED");
-
+						// ★ NEW: 이미 Open이면 스킵
+						if (gcode == 0x01) {
+							AppendLog(L"[SKIP] NoBox()==true and Grip already OPEN (0x01) -> skip grip action");
+							okGrip = true;
 						}
-
-						AppendLog(L"[AUTO] Grip Open -> GripCode=0x01 (Open) forced");
-						
+						else {
+							AppendLog(L"[AUTO] NoBox()==true -> Grip Open");
+							DoOpen_Compat(g_hDemoWnd);
+							okGrip = WaitUntil(IsGripperOpenAndIdle, 5000);
+							if (!okGrip) {
+								AppendLog(L"[AUTO][WARN] Grip Open or Idle wait FAILED");
+							}
+							else {
+								AppendLog(L"[AUTO] Grip Open DONE (Idle)");
+							}
+						}						
 					}
 
 					// 1) Axis2가 Limit(Up) 상태가 아니면 먼저 Up으로 정리

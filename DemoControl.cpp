@@ -31,6 +31,8 @@ extern bool StartAbsMoveWithProfile(int axis, long long target, double vpps, dou
 extern void StopAxis(int axis);
 
 extern std::atomic<unsigned char> g_demoAlarm;
+extern std::atomic<bool> g_driveReady;
+
 
 // 첫 에러만 유지(라치)하고 싶으면 이 헬퍼도 같이 쓰자
 static inline void LatchDemoAlarm(unsigned char code)
@@ -72,6 +74,10 @@ enum : unsigned char
     DEMO_ALM_UNLOAD_GO_CONVEYOR_TIMEOUT = 0x26,
     DEMO_ALM_UNLOAD_ABORTED_OR_STOP = 0x27,
     DEMO_ALM_UNLOAD_COMM_NOT_STARTED = 0x28,
+
+    DEMO_ALM_SERVO12_OFF = 0x30, // Axis1 + Axis2 둘 다 ServoOff
+    DEMO_ALM_SERVO1_OFF = 0x31, // Axis1 ServoOff
+    DEMO_ALM_SERVO2_OFF = 0x32, // Axis2 ServoOff
 
     // -------- 공통(0xF0~)
     DEMO_ALM_UNKNOWN = 0xF0
@@ -653,6 +659,17 @@ static std::atomic<DWORD> g_ax2ServoOnTime{ 0 };
 static const DWORD AX2_SENSOR_ENABLE_DELAY_MS = 1500;
 static const double vel_idle_threshold = 1.0;
 static const long long inpos_tol_counts = 10;
+
+static bool IsAxisServoOn(int axis)
+{
+    if (!g_commStarted) return false;
+    CoreMotionStatus st{};
+    g_cm.GetStatus(&st);
+
+    // ✅ 프로젝트 구조에 맞게 필드명만 맞춰줘.
+    // WMX3에선 보통 servoOn / servoState / ampEnabled 류가 있음.
+    return (st.axesStatus[axis].servoOn != 0);
+}
 
 static bool IsAxis2ServoOn()
 {
@@ -2037,6 +2054,18 @@ void StartDemoWorkWithoutBox()
 void StartDemoLoad()
 {
     if (!g_commStarted) { SetTaskState(TaskId::DemoLoad, TaskState::Failed); LatchDemoAlarm(DEMO_ALM_LOAD_COMM_NOT_STARTED); return; }
+    // ★ NEW: Axis1, Axis2 ServoOn 요구 (자동으로 켜지 않고 "켜라" 알람만)
+    const bool s1 = IsAxisServoOn(1);
+    const bool s2 = IsAxisServoOn(2);
+    if (!s1 || !s2) {
+        SetTaskState(TaskId::DemoLoad, TaskState::Failed);
+
+        if (!s1 && !s2)      LatchDemoAlarm(DEMO_ALM_SERVO12_OFF);
+        else if (!s1)        LatchDemoAlarm(DEMO_ALM_SERVO1_OFF);
+        else                 LatchDemoAlarm(DEMO_ALM_SERVO2_OFF);
+
+        return;
+    }
     if (g_taskStatus[(int)TaskId::DemoLoad].state.load() == TaskState::Running) return;
 
     // ★ 시퀀스 시작 전 상태 체크:
@@ -2116,7 +2145,7 @@ void StartDemoLoad()
         // 2. 그리퍼 Close (박스 잡기)
         if (ok) {
 			DoGripServoOff_Compat(g_hDemoWnd); // Servo ON
-            Sleep(500);
+            Sleep(100);
             DoClose_Compat(g_hDemoWnd);
 
             // Load의 목적은 "박스를 잡는 것"이므로 HasBox()를 기준으로 대기
@@ -2172,6 +2201,7 @@ void StartDemoLoad()
         Sleep(1000);
 
         SetTaskState(TaskId::DemoLoad, ok ? TaskState::Done : TaskState::Failed);
+        if (!ok) g_driveReady.store(false, std::memory_order_relaxed); // ★ NEW
         }).detach();
 }
 
@@ -2179,6 +2209,18 @@ void StartDemoLoad()
 void StartDemoUnload()
 {
     if (!g_commStarted) { SetTaskState(TaskId::DemoUnload, TaskState::Failed); LatchDemoAlarm(DEMO_ALM_UNLOAD_COMM_NOT_STARTED); return; }
+    // ★ NEW: Axis1, Axis2 ServoOn 요구 (자동으로 켜지 않고 "켜라" 알람만)
+    const bool s1 = IsAxisServoOn(1);
+    const bool s2 = IsAxisServoOn(2);
+    if (!s1 || !s2) {
+        SetTaskState(TaskId::DemoLoad, TaskState::Failed);
+
+        if (!s1 && !s2)      LatchDemoAlarm(DEMO_ALM_SERVO12_OFF);
+        else if (!s1)        LatchDemoAlarm(DEMO_ALM_SERVO1_OFF);
+        else                 LatchDemoAlarm(DEMO_ALM_SERVO2_OFF);
+
+        return;
+    }
     if (g_taskStatus[(int)TaskId::DemoUnload].state.load() == TaskState::Running) return;
 
     if (!CheckDemoUnloadPreconditions()) {
@@ -2254,7 +2296,7 @@ void StartDemoUnload()
         // 3. 그리퍼 Open (박스 내려놓기)
         if (ok) {
 			DoGripServoOff_Compat(g_hDemoWnd); // Servo ON
-            Sleep(500);
+            Sleep(100);
             DoOpen_Compat(g_hDemoWnd);
             bool released = WaitUntil(NoBox, 5000);
             bool openIdle = WaitUntil(IsGripperOpenAndIdle, 5000);
@@ -2290,6 +2332,7 @@ void StartDemoUnload()
         Sleep(1000);
 
         SetTaskState(TaskId::DemoUnload, ok ? TaskState::Done : TaskState::Failed);
+        if (!ok) g_driveReady.store(false, std::memory_order_relaxed); // ★ NEW
         }).detach();
 }
 
