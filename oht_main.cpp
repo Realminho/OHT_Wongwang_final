@@ -137,6 +137,12 @@ const DWORD LOG_POLL_MS = 50;
 // 축별 명령 수신/완료 카운터
 std::atomic<unsigned long> g_cmdDoneCount[4] = { 0,0,0,0 };
 
+std::atomic<bool> g_forceGripCodeZero{ false };
+
+std::atomic<bool> g_gripHoldCodeZero{ false };  // true면 무조건 0x00
+std::atomic<bool> g_gripAwaitDone{ false };     // 명령 후 완료대기
+std::atomic<bool> g_gripSawBusy{ false };       // busy를 한번이라도 봤는지
+
 
 // 명령 추적
 struct AxisCommandInfo {
@@ -2064,6 +2070,37 @@ unsigned char CalcPosGripCode()
 {
 	// 진행중이면 0x00 (기본)
 	bool busy = g_gripBusy.load(std::memory_order_relaxed) || g_diStable[0];
+
+	// 1) HOLD가 켜져 있으면 기본은 무조건 0x00
+	if (g_gripHoldCodeZero.load(std::memory_order_relaxed))
+	{
+		// 1-1) 명령 후 완료대기 중이면: busy->idle 전이를 기다린다
+		if (g_gripAwaitDone.load(std::memory_order_relaxed))
+		{
+			if (busy) {
+				g_gripSawBusy.store(true, std::memory_order_relaxed);
+				return 0x00; // 동작 중 0x00 고정
+			}
+
+			// idle 상태
+			if (g_gripSawBusy.load(std::memory_order_relaxed)) {
+				// busy를 한번 봤고 이제 idle이면 "동작 완료"로 판단
+				g_gripAwaitDone.store(false, std::memory_order_relaxed);
+				g_gripSawBusy.store(false, std::memory_order_relaxed);
+				g_gripHoldCodeZero.store(false, std::memory_order_relaxed); // 이제 자동 갱신 허용
+				// 아래 기존 자동판정 로직으로 내려가서 0x01/0x02를 산출
+			}
+			else {
+				// 명령은 받았는데 아직 busy가 한번도 안 켜짐(지연/실패/대기)
+				return 0x00;
+			}
+		}
+		else {
+			// 1-2) Stop 이후, 명령이 오기 전(또는 Reset만 한 상태): 계속 0x00
+			return 0x00;
+		}
+	}
+
 	if (busy) {
 		DWORD now = GetTickCount();
 		DWORD t0 = g_gripBusyStartTick.load(std::memory_order_relaxed);
@@ -2137,6 +2174,15 @@ static unsigned short NextOhtMsgId()
 		// 실패하면 cur가 새 값으로 갱신되니 다시 루프 돌면서 재시도
 	}
 }
+
+inline void ForceGripCodeZero(bool on)
+{
+	g_forceGripCodeZero.store(on, std::memory_order_relaxed);
+	if (on) {
+		g_gripBusyStartTick.store(0, std::memory_order_relaxed); // 타이머도 리셋(선택)
+	}
+}
+
 
 static void SendPeriodicStateFrame(SOCKET s)
 {
@@ -2493,6 +2539,17 @@ std::atomic<bool> g_motionBusy{ false };
 std::atomic<bool> g_ackLoadDone{ false };
 std::atomic<bool> g_ackUnloadDone{ false };
 
+// 0x2C 또는 0x2F 수신 시 공통으로 호출
+inline void BeginGripOpReportGate()
+{
+	// Stop 이후 hold 상태에서만 의미가 있음 (그 외에도 안전하게 작동)
+	g_gripHoldCodeZero.store(true, std::memory_order_relaxed); // 동작 중 0x00 유지
+	g_gripAwaitDone.store(true, std::memory_order_relaxed); // 완료 기다림
+	g_gripSawBusy.store(false, std::memory_order_relaxed); // 새 동작 시작
+	g_gripBusyStartTick.store(0, std::memory_order_relaxed); // stuck 타이머 리셋
+}
+
+
 void TcpServerThreadProc()
 {
 	WSADATA wsa{};
@@ -2769,12 +2826,15 @@ void TcpServerThreadProc()
 				AppendLog(L"[INFO] PLC -> PC : Stop Motion Request");
 				SendSimpleAck(g_clientSock, 0x29);
 				AppendLog(L"[TX] Stop Request ACK sent");
+				g_driveReady.store(false, std::memory_order_relaxed);
+
+				// ★ 추가: Stop 들어오면 GripCode를 0x00으로 강제
+				g_forceGripCodeZero.store(true, std::memory_order_relaxed);
+				g_gripBusyStartTick.store(0, std::memory_order_relaxed); // 선택: stuck 타이머 리셋
+				AppendLog(L"[ACT] GripCode forced to 0x00 due to Stop");
 
 				DoStopAll(nullptr);
-
-
-
-				
+								
 				AppendLog(L"[ACT] All axes QuickStop executed");
 
 				if (WaitAllAxesStopped(1.0, 10000)) {
@@ -2803,6 +2863,13 @@ void TcpServerThreadProc()
 					AppendLog(L"[WARN] Stop timeout : some axes still moving or Motioning still ON");
 					return false;
 				}
+				
+
+				g_gripHoldCodeZero.store(true, std::memory_order_relaxed);
+				g_gripAwaitDone.store(false, std::memory_order_relaxed);
+				g_gripSawBusy.store(false, std::memory_order_relaxed);
+				g_gripBusyStartTick.store(0, std::memory_order_relaxed);
+				AppendLog(L"[ACT] GripCode HOLD=0x00 (Stop)");
 
 				// ---------------- RESET ----------------
 			case 0xFD: // 리셋
@@ -3093,7 +3160,7 @@ void TcpServerThreadProc()
 							okGrip = true;
 							break;
 						}
-
+						BeginGripOpReportGate();
 						AppendLog(L"[ACT] Grip Pos1 -> GripOpen");
 						g_gripBusy = true;
 
@@ -3116,7 +3183,7 @@ void TcpServerThreadProc()
 							okGrip = false;
 							break;
 						}
-
+						BeginGripOpReportGate();
 						AppendLog(L"[ACT] Grip Pos2 -> GripClose");
 						g_gripBusy = true;
 
