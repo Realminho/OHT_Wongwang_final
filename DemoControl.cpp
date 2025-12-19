@@ -1771,7 +1771,7 @@ void DoUp() {
 void DoStopAll(HWND hWnd) {
     DoGripServoOff_Compat(hWnd);
     g_bcRunner.Stop();
-    for (int a = 0; a < 4; ++a) StopAxis(a);
+    for (int a = 1; a < 3; ++a) StopAxis(a);
     for (int i = 0; i < (int)TaskId::COUNT; ++i) {
         if (g_taskStatus[i].state.load() == TaskState::Running) SetTaskState((TaskId)i, TaskState::Stopped);
     }

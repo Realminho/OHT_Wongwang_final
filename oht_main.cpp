@@ -143,6 +143,10 @@ std::atomic<bool> g_gripHoldCodeZero{ false };  // true면 무조건 0x00
 std::atomic<bool> g_gripAwaitDone{ false };     // 명령 후 완료대기
 std::atomic<bool> g_gripSawBusy{ false };       // busy를 한번이라도 봤는지
 
+// Stop(0x29) 이후 Reset(0xFD) 전까지 명령 차단 라치
+std::atomic_bool g_stop29Latched{ false };
+
+
 
 // 명령 추적
 struct AxisCommandInfo {
@@ -1340,6 +1344,20 @@ static bool CanAxis2Move_Auto()
 	unsigned char code = CalcPosTravelCode();
 	return (code == 0x01 || code == 0x02);
 }
+
+static bool CanAxis2Move_Auto_RequireTravel(unsigned char requiredCode)
+{
+	unsigned char code = CalcPosTravelCode();
+	if (code != requiredCode) {
+		wchar_t s[128];
+		swprintf_s(s, L"[INTERLOCK] Axis2 blocked: TravelCode=0x%02X, required=0x%02X",
+			(unsigned)code, (unsigned)requiredCode);
+		//AppendLog(s);
+		return false;
+	}
+	return true;
+}
+
 
 // Auto 모드에서 Axis0/Axis2 인터락 메시지
 static void ShowAxis0InterlockMsg()
@@ -2543,8 +2561,8 @@ std::atomic<bool> g_ackUnloadDone{ false };
 inline void BeginGripOpReportGate()
 {
 	// Stop 이후 hold 상태에서만 의미가 있음 (그 외에도 안전하게 작동)
-	g_gripHoldCodeZero.store(true, std::memory_order_relaxed); // 동작 중 0x00 유지
-	g_gripAwaitDone.store(true, std::memory_order_relaxed); // 완료 기다림
+	g_gripHoldCodeZero.store(false, std::memory_order_relaxed); // 동작 중 0x00 유지
+	g_gripAwaitDone.store(false, std::memory_order_relaxed); // 완료 기다림
 	g_gripSawBusy.store(false, std::memory_order_relaxed); // 새 동작 시작
 	g_gripBusyStartTick.store(0, std::memory_order_relaxed); // stuck 타이머 리셋
 }
@@ -2697,6 +2715,12 @@ void TcpServerThreadProc()
 			{
 				AppendLog(L"[INFO] PLC -> PC : Load Request");
 
+				if (g_stop29Latched.load(std::memory_order_acquire)) {
+					AppendLog(L"[BLOCK] 0x21 ignored: Stop29 latch is ON (wait Reset 0xFD)");
+					SendSimpleAck(g_clientSock, 0x21);
+					return true;
+				}
+
 				// 이미 다른 모션/시퀀스 동작 중이면 거부
 				bool expectedBusy = false;
 				if (!g_motionBusy.compare_exchange_strong(expectedBusy, true)) {
@@ -2765,6 +2789,12 @@ void TcpServerThreadProc()
 			{
 				AppendLog(L"[INFO] PLC -> PC : Unload Request");
 
+				if (g_stop29Latched.load(std::memory_order_acquire)) {
+					AppendLog(L"[BLOCK] 0x22 ignored: Stop29 latch is ON (wait Reset 0xFD)");
+					SendSimpleAck(g_clientSock, 0x22);
+					return true;
+				}
+
 				bool expectedBusy = false;
 				if (!g_motionBusy.compare_exchange_strong(expectedBusy, true)) {
 					AppendLog(L"[BUSY] Unload command ignored: motion already in progress");
@@ -2823,18 +2853,29 @@ void TcpServerThreadProc()
 
 			// ---------------- STOP (즉시 처리) ----------------
 			case 0x29: // 축정지
+			{
 				AppendLog(L"[INFO] PLC -> PC : Stop Motion Request");
 				SendSimpleAck(g_clientSock, 0x29);
 				AppendLog(L"[TX] Stop Request ACK sent");
+
 				g_driveReady.store(false, std::memory_order_relaxed);
 
+				// ★ Stop 라치 ON (Reset 전까지 명령 차단)
+				g_stop29Latched.store(true, std::memory_order_release);
+				AppendLog(L"[STATE] Stop29 latch ON: block motion/grip commands until Reset(0xFD)");
+
+
 				// ★ 추가: Stop 들어오면 GripCode를 0x00으로 강제
-				g_forceGripCodeZero.store(true, std::memory_order_relaxed);
+				//g_forceGripCodeZero.store(true, std::memory_order_relaxed);
+				g_gripHoldCodeZero.store(true, std::memory_order_relaxed);
+				g_gripAwaitDone.store(false, std::memory_order_relaxed);
+				g_gripSawBusy.store(false, std::memory_order_relaxed);
 				g_gripBusyStartTick.store(0, std::memory_order_relaxed); // 선택: stuck 타이머 리셋
-				AppendLog(L"[ACT] GripCode forced to 0x00 due to Stop");
+
+				AppendLog(L"[ACT] GripCode HOLD=0x00 (Stop)");
 
 				DoStopAll(nullptr);
-								
+
 				AppendLog(L"[ACT] All axes QuickStop executed");
 
 				if (WaitAllAxesStopped(1.0, 10000)) {
@@ -2863,19 +2904,20 @@ void TcpServerThreadProc()
 					AppendLog(L"[WARN] Stop timeout : some axes still moving or Motioning still ON");
 					return false;
 				}
-				
 
-				g_gripHoldCodeZero.store(true, std::memory_order_relaxed);
-				g_gripAwaitDone.store(false, std::memory_order_relaxed);
-				g_gripSawBusy.store(false, std::memory_order_relaxed);
-				g_gripBusyStartTick.store(0, std::memory_order_relaxed);
-				AppendLog(L"[ACT] GripCode HOLD=0x00 (Stop)");
+			}
+				
 
 				// ---------------- RESET ----------------
 			case 0xFD: // 리셋
 			{
 				ToggleDO_HW(11, false, nullptr);
 				AppendLog(L"[INFO] PLC -> PC : Reset Request");
+
+				// ★ Reset 들어오면 Stop 라치 OFF (다시 명령 허용)
+				g_stop29Latched.store(false, std::memory_order_release);
+				AppendLog(L"[STATE] Stop29 latch OFF: commands enabled");
+
 				for (int a = 0; a < 4; ++a) {
 					g_cm.axisControl->ClearAmpAlarm(a);
 				}
@@ -2885,6 +2927,15 @@ void TcpServerThreadProc()
 				// 운전 준비 플래그도 리셋
 				g_driveReady.store(false, std::memory_order_relaxed);
 				g_demoAlarm.store(0x00, std::memory_order_relaxed); // ★ NEW
+
+				// ★ Reset 들어오면: Stop으로 강제하던 Grip 0x00 잠금 해제 → 자동판정 복귀
+				//g_forceGripCodeZero.store(false, std::memory_order_relaxed);
+				g_gripHoldCodeZero.store(true, std::memory_order_relaxed);
+				g_gripAwaitDone.store(false, std::memory_order_relaxed);
+				g_gripSawBusy.store(false, std::memory_order_relaxed);
+				g_gripBusyStartTick.store(0, std::memory_order_relaxed);
+
+				AppendLog(L"[ACT] GripCode auto-report re-enabled (force/hold cleared) due to Reset");
 
 				// 현재 Servo 상태 확인
 				bool s1 = IsAxisServoOn(1);
@@ -2939,6 +2990,12 @@ void TcpServerThreadProc()
 				// ---------------- TRAVEL (Axis0) ----------------
 			case 0x2A: // 주행 포지션 기동
 			{
+				if (g_stop29Latched.load(std::memory_order_acquire)) {
+					AppendLog(L"[BLOCK] 0x2A ignored: Stop29 latch is ON (wait Reset 0xFD)");
+					SendSimpleAck(g_clientSock, 0x2A);
+					return true;
+				}
+
 				// 인터락 체크
 				if (!CheckInterlockBeforeAxisCommand(0)) {
 					AppendLog(L"[INTERLOCK] Axis0 blocked: Axis2 limit must be ON in Auto");
@@ -3027,6 +3084,12 @@ void TcpServerThreadProc()
 			// ---------------- HOIST (Axis2) ----------------
 			case 0x2B: // 상하 포지션 기동
 			{
+				if (g_stop29Latched.load(std::memory_order_acquire)) {
+					AppendLog(L"[BLOCK] 0x2B ignored: Stop29 latch is ON (wait Reset 0xFD)");
+					SendSimpleAck(g_clientSock, 0x2B);
+					return true;
+				}
+
 				if (!CheckInterlockBeforeAxisCommand(2)) {
 					AppendLog(L"[INTERLOCK] Axis2 blocked: Travel must be at Load/Unload in Auto");
 					LatchDemoAlarm(DEMO_ALM_HOIST_INTERLOCK_FAIL); // ★ NEW
@@ -3064,6 +3127,11 @@ void TcpServerThreadProc()
 
 					switch (posNo) {
 					case 1:
+						if (!CanAxis2Move_Auto_RequireTravel(0x01)) {
+							AppendLog(L"[INTERLOCK] Axis2 blocked: Travel must be at Load/Unload in Auto");
+							LatchDemoAlarm(DEMO_ALM_HOIST_INTERLOCK_FAIL); // ★ NEW
+							return false;
+						}
 						AppendLog(L"[ACT] Hoist Pos1 -> Conveyor Down");
 						ToggleDO_HW(11, true, nullptr);
 						ConveyorDown();
@@ -3076,6 +3144,11 @@ void TcpServerThreadProc()
 						break;
 
 					case 2:
+						if (!CanAxis2Move_Auto_RequireTravel(0x02)) {
+							AppendLog(L"[INTERLOCK] Axis2 blocked: Travel must be at Load/Unload in Auto");
+							LatchDemoAlarm(DEMO_ALM_HOIST_INTERLOCK_FAIL); // ★ NEW
+							return false;
+						}
 						AppendLog(L"[ACT] Hoist Pos2 -> Work Down");
 						ToggleDO_HW(11, true, nullptr);
 						WorkDown();
@@ -3121,6 +3194,14 @@ void TcpServerThreadProc()
 			// ---------------- GRIP ----------------
 			case 0x2C: // 그립 포지션 기동
 			{
+				if (g_stop29Latched.load(std::memory_order_acquire)) {
+					AppendLog(L"[BLOCK] 0x2C ignored: Stop29 latch is ON (wait Reset 0xFD)");
+					SendSimpleAck(g_clientSock, 0x2C);   // PLC 대기 방지용
+					return true;                         // “처리 완료(동작 없음)”로 간주
+				}
+
+
+
 				unsigned char posNo = (payLen >= 1) ? f[5] : 0;
 				wchar_t info[128];
 				swprintf_s(info, L"[INFO] PLC -> PC : Grip Position Command, Pos=%u", (unsigned)posNo);
@@ -3223,6 +3304,12 @@ void TcpServerThreadProc()
 			{
 				AppendLog(L"[INFO] PLC -> PC : Drive Ready Request (0x2F)");
 
+				if (g_stop29Latched.load(std::memory_order_acquire)) {
+					AppendLog(L"[BLOCK] 0x2F ignored: Stop29 latch is ON (wait Reset 0xFD)");
+					SendSimpleAck(g_clientSock, 0x2F);
+					return true;
+				}
+
 				// 다른 모션 중이면 거부
 				bool expectedBusy = false;
 				if (!g_motionBusy.compare_exchange_strong(expectedBusy, true)) {
@@ -3244,6 +3331,7 @@ void TcpServerThreadProc()
 					AppendLog(info);
 
 					if (HasBox()) {
+						BeginGripOpReportGate();
 						// ★ NEW: 이미 Close면 스킵
 						if (gcode == 0x02) {
 							AppendLog(L"[SKIP] HasBox()==true and Grip already CLOSED (0x02) -> skip grip action");
@@ -3262,7 +3350,8 @@ void TcpServerThreadProc()
 						}
 					}
 					
-					else if (NoBox()) {					
+					else if (NoBox()) {		
+						BeginGripOpReportGate();
 						// ★ NEW: 이미 Open이면 스킵
 						if (gcode == 0x01) {
 							AppendLog(L"[SKIP] NoBox()==true and Grip already OPEN (0x01) -> skip grip action");
@@ -3307,6 +3396,8 @@ void TcpServerThreadProc()
 					else {
 						AppendLog(L"[ACT] DriveReady: Hoist already UP(0x03)");
 					}
+
+					std::this_thread::sleep_for(std::chrono::seconds(1));
 
 					// 운전 준비 완료 플래그 ON
 					if (hcode == 0x03 && gcode != 0x00) {
