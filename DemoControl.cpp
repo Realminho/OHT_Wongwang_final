@@ -1755,7 +1755,7 @@ void WorkDown() {
 void ConveyorDown() {
     if (!g_commStarted) { SetTaskState(TaskId::ConveyorDown, TaskState::Failed); return; }
     int ax = 2;
-    long long tgt = 51600;
+    long long tgt = 51910;
     StartMoveWithApproach(ax, tgt, TaskId::ConveyorDown,
         10000.0, 1000.0, 1500.0,
         10.0, 2.0, 30000,
