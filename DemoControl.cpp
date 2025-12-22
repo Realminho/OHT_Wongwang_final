@@ -1701,7 +1701,7 @@ void DoOpen_Compat(HWND hWnd)
     // 그리퍼 Open 명령 시작
     SetTaskState(TaskId::GripOpen, TaskState::Running);
 
-
+	ToggleDO_HW(11, true, hWnd); // LED ON
     //   // 1) STO 펄스 (10번: ON → 타이머로 자동 OFF)
        //DoGripServoOff_Compat(hWnd);
 
@@ -1723,7 +1723,7 @@ void DoClose_Compat(HWND hWnd)
 
     // 1) STO 펄스
     //DoGripServoOff_Compat(hWnd);
-
+    ToggleDO_HW(11, true, hWnd); // LED ON
     // 2) Open OFF
     ToggleDO_HW(8, false, hWnd);
     SetTaskState(TaskId::GripOpen, TaskState::Idle);
