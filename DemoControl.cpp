@@ -1455,7 +1455,7 @@ bool IsAxis2Conveyordown()
     CoreMotionStatus st{};
     g_cm.GetStatus(&st);
 
-    const long long targetPos = 51600;       // DoUp()에서 사용하는 타겟
+    const long long targetPos = 51910;       // DoUp()에서 사용하는 타겟
     const double posEps = 10.0;          // 위치 허용 오차
     const double velEps = 1.0;           // 속도 허용 오차
 
