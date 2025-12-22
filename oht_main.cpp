@@ -3232,10 +3232,10 @@ void TcpServerThreadProc()
 
 					switch (posNo) {
 					case 1: // Open
-						/*if (HasBox()) {
+						if (HasBox()) {
 							AppendLog(L"[INTERLOCK] Grip Open blocked: HasBox()==true");
 							break;
-						}*/
+						}
 						if (IsGripperAlreadyOpen()) {
 							AppendLog(L"[SKIP] Grip already OPEN. No action performed.");
 							okGrip = true;
