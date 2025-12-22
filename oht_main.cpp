@@ -2510,6 +2510,38 @@ static void DoOhtAction_EStopAll() {
 	for (int a = 0; a < 4; ++a) StopAxis(a);
 }
 
+// Stop 라치 동안 DO11 블링크 스레드 중복 실행 방지용
+std::atomic<bool> g_do11BlinkRunning{ false };
+
+// Stop 라치가 ON인 동안만 DO11을 깜빡이게 함
+inline void StartDO11Blink_UntilReset()
+{
+	bool expected = false;
+	if (!g_do11BlinkRunning.compare_exchange_strong(expected, true,
+		std::memory_order_acq_rel, std::memory_order_relaxed))
+	{
+		// 이미 블링크 스레드가 돌고 있음
+		return;
+	}
+
+	std::thread([]() {
+		using namespace std::chrono_literals;
+
+		bool on = false;
+
+		// Stop29 latch가 ON인 동안만 계속 토글
+		while (g_stop29Latched.load(std::memory_order_acquire)) {
+			on = !on;
+			ToggleDO_HW(11, on, nullptr);      // ★ ON/OFF 번갈아
+			std::this_thread::sleep_for(250ms); // 주기(원하는대로 200~500ms 추천)
+		}
+
+		// Reset 들어와 latch OFF되면 DO11은 반드시 OFF로 정리
+		ToggleDO_HW(11, false, nullptr);
+
+		g_do11BlinkRunning.store(false, std::memory_order_release);
+		}).detach();
+}
 
 // Periodic thread proc [NEW]
 void PeriodicThreadProc()
@@ -2864,6 +2896,9 @@ void TcpServerThreadProc()
 				g_stop29Latched.store(true, std::memory_order_release);
 				AppendLog(L"[STATE] Stop29 latch ON: block motion/grip commands until Reset(0xFD)");
 
+				// ★ NEW: DO11 블링크 시작 (Reset 전까지)
+				StartDO11Blink_UntilReset();
+				AppendLog(L"[ACT] DO11 blinking until Reset(0xFD)");
 
 				// ★ 추가: Stop 들어오면 GripCode를 0x00으로 강제
 				//g_forceGripCodeZero.store(true, std::memory_order_relaxed);
@@ -2874,7 +2909,9 @@ void TcpServerThreadProc()
 
 				AppendLog(L"[ACT] GripCode HOLD=0x00 (Stop)");
 
-				DoStopAll(nullptr);
+				//DoStopAll(nullptr);
+				g_cm.ExecEStop(EStopLevel::Final);
+				
 
 				AppendLog(L"[ACT] All axes QuickStop executed");
 
@@ -2895,7 +2932,7 @@ void TcpServerThreadProc()
 							AppendLog(msg);
 						}
 					}
-					ToggleDO_HW(11, false, nullptr);
+					//ToggleDO_HW(11, false, nullptr);
 					SendSimpleDone(g_clientSock, 0x29);
 					AppendLog(L"[TX] Stop Done sent");
 					return true;
@@ -2913,6 +2950,8 @@ void TcpServerThreadProc()
 			{
 				ToggleDO_HW(11, false, nullptr);
 				AppendLog(L"[INFO] PLC -> PC : Reset Request");
+
+				g_cm.ReleaseEStop();
 
 				// ★ Reset 들어오면 Stop 라치 OFF (다시 명령 허용)
 				g_stop29Latched.store(false, std::memory_order_release);
@@ -3399,12 +3438,23 @@ void TcpServerThreadProc()
 
 					std::this_thread::sleep_for(std::chrono::seconds(1));
 
+					// ===== 3) 최종 상태 재계산 후 DriveReady 결정 =====
+					unsigned char gFinal = CalcPosGripCode();
+					unsigned char hFinal = CalcPosHoistCode();
+
 					// 운전 준비 완료 플래그 ON
-					if (hcode == 0x03 && gcode != 0x00) {
+					if (hFinal == 0x03 && gFinal != 0x00) {
 						g_driveReady.store(true, std::memory_order_relaxed);
 						AppendLog(L"[INFO] DriveReady sequence complete -> driveReady = 1");
+						// ★ 요청사항: "모든 동작 완료 후" driveReady가 true가 되면 그때 DO11 OFF
+						ToggleDO_HW(11, false, nullptr);
+						AppendLog(L"[ACT] DO11 OFF (DriveReady==true)");
 					}
-					
+
+					else {
+						g_driveReady.store(false, std::memory_order_relaxed);
+						AppendLog(L"[INFO] DriveReady NOT complete -> driveReady = 0");
+					}
 
 					g_motionBusy.store(false);
 					}).detach();
