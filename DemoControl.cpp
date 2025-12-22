@@ -2103,8 +2103,20 @@ void StartDemoLoad()
         }
         else if (!HasBox() && gcode != 0x01) {
             // 2-1) 먼저 Close 쪽으로 정리
-            DoOpen_Compat(g_hDemoWnd);
-            (void)WaitUntil(IsGripperOpenAndIdle, 5000);
+            // 박스가 없다면 Open 상태로 정리
+            DoClose_Compat(g_hDemoWnd);
+            bool okclose = WaitUntil(IsGripperClosedAndIdle, 6000);
+            bool nobox = !HasBox();
+            if (nobox && !okclose) {
+                DoGripServoOff_Compat(g_hDemoWnd);
+                DoOpen_Compat(g_hDemoWnd);
+                (void)WaitUntil(IsGripperOpenAndIdle, 6000);
+            }
+            else if (nobox && okclose) {
+                DoGripServoOff_Compat(g_hDemoWnd);
+                DoOpen_Compat(g_hDemoWnd);
+                (void)WaitUntil(IsGripperOpenAndIdle, 6000);
+            }
 
             // 2-2) Close 상태에서 Servo OFF
             DoGripServoOff_Compat(g_hDemoWnd);
@@ -2145,7 +2157,7 @@ void StartDemoLoad()
         // 2. 그리퍼 Close (박스 잡기)
         if (ok) {
 			DoGripServoOff_Compat(g_hDemoWnd); // Servo ON
-            Sleep(100);
+            //Sleep(100);
             DoClose_Compat(g_hDemoWnd);
 
             // Load의 목적은 "박스를 잡는 것"이므로 HasBox()를 기준으로 대기
@@ -2198,7 +2210,7 @@ void StartDemoLoad()
             }
         }
 
-        Sleep(1000);
+        Sleep(200);
 
         SetTaskState(TaskId::DemoLoad, ok ? TaskState::Done : TaskState::Failed);
         if (!ok) g_driveReady.store(false, std::memory_order_relaxed); // ★ NEW
@@ -2241,7 +2253,7 @@ void StartDemoUnload()
 
             // 2-1) 먼저 Close 쪽으로 정리
             DoClose_Compat(g_hDemoWnd);
-            (void)WaitUntil(IsGripperClosedAndIdle, 5000);
+            (void)WaitUntil(IsGripperClosedAndIdle, 6000);
 
             // 2-2) Close 상태에서 Servo OFF
             DoGripServoOff_Compat(g_hDemoWnd);
@@ -2250,9 +2262,23 @@ void StartDemoUnload()
         }
         else if(!HasBox() && gcode != 0x01) {
             // 박스가 없다면 Open 상태로 정리
-            DoOpen_Compat(g_hDemoWnd);
-            (void)WaitUntil(IsGripperOpenAndIdle, 5000);
+            // 2-1) 먼저 Close 쪽으로 정리
+            // 박스가 없다면 Open 상태로 정리
+            DoClose_Compat(g_hDemoWnd);
+            bool okclose = WaitUntil(IsGripperClosedAndIdle, 6000);
+            bool nobox = !HasBox();
+            if (nobox && !okclose) {
+                DoGripServoOff_Compat(g_hDemoWnd);
+                DoOpen_Compat(g_hDemoWnd);
+                (void)WaitUntil(IsGripperOpenAndIdle, 6000);
+            }
+            else if (nobox && okclose) {
+                DoGripServoOff_Compat(g_hDemoWnd);
+                DoOpen_Compat(g_hDemoWnd);
+                (void)WaitUntil(IsGripperOpenAndIdle, 6000);
+            }
 
+            
             DoGripServoOff_Compat(g_hDemoWnd);
         }
         else if (!HasBox() && gcode == 0x01) {
@@ -2296,7 +2322,7 @@ void StartDemoUnload()
         // 3. 그리퍼 Open (박스 내려놓기)
         if (ok) {
 			DoGripServoOff_Compat(g_hDemoWnd); // Servo ON
-            Sleep(100);
+            //Sleep(100);
             DoOpen_Compat(g_hDemoWnd);
             bool released = WaitUntil(NoBox, 5000);
             bool openIdle = WaitUntil(IsGripperOpenAndIdle, 5000);
@@ -2329,7 +2355,7 @@ void StartDemoUnload()
                 LatchDemoAlarm(DEMO_ALM_UNLOAD_GO_CONVEYOR_TIMEOUT);
             }
         }
-        Sleep(1000);
+        Sleep(200);
 
         SetTaskState(TaskId::DemoUnload, ok ? TaskState::Done : TaskState::Failed);
         if (!ok) g_driveReady.store(false, std::memory_order_relaxed); // ★ NEW
