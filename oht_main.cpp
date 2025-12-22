@@ -2072,7 +2072,7 @@ static unsigned char CalcPosHoistCode()
 	if (!g_commStarted) return 0x00;
 	g_cm.GetStatus(&g_status);
 	long long p = (long long)g_status.axesStatus[2].actualPos;
-	if (BetweenTol(p, 51600, 10)) return 0x01;
+	if (BetweenTol(p, 51910, 10)) return 0x01;
 	if (BetweenTol(p, 45000, 10)) return 0x02;
 	if (BetweenTol(p, 0, 10))     return 0x03;
 	return 0x00;
@@ -3232,10 +3232,10 @@ void TcpServerThreadProc()
 
 					switch (posNo) {
 					case 1: // Open
-						if (HasBox()) {
+						/*if (HasBox()) {
 							AppendLog(L"[INTERLOCK] Grip Open blocked: HasBox()==true");
 							break;
-						}
+						}*/
 						if (IsGripperAlreadyOpen()) {
 							AppendLog(L"[SKIP] Grip already OPEN. No action performed.");
 							okGrip = true;
