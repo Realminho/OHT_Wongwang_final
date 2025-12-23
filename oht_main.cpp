@@ -99,6 +99,8 @@ extern struct ApproachProfile {
 	double decMs = 10.0;
 };
 
+static void SendSimpleAck(SOCKET s, unsigned char reqOpCode);
+
 extern void StartMoveWithApproach(int axis, long long target, TaskId task,
 	double mainVpps, double mainAccMs, double mainDecMs,
 	double posEps, double velEps, DWORD timeoutMs,
@@ -2018,6 +2020,7 @@ static bool IsAxisServoOn(int axis)
 enum : unsigned char
 {
 	DEMO_ALM_NONE = 0x00,
+	SERVO_ALM = 0x30,
 
 	// ---- TRAVEL(0x2A): 0x40~0x4F
 	DEMO_ALM_TRAVEL_INTERLOCK_FAIL = 0x40,
@@ -2083,6 +2086,55 @@ static std::atomic<DWORD> g_gripBusyStartTick{ 0 };
 // “중복 명령 후 stuck”으로 판단할 시간(ms) - 필요에 맞게 조절
 static constexpr DWORD GRIP_STUCK_REPORT_MS = 5000; // 예: 2초
 extern std::atomic<unsigned char> g_doShadow[32];
+
+std::atomic<bool> g_servo12Ready{ true };         // “명령 수신 가능” 게이트
+std::atomic<bool> g_servo12MonRunning{ false };   // 중복 스레드 방지
+
+inline void StartServo12ReadyMonitor()
+{
+	bool expected = false;
+	if (!g_servo12MonRunning.compare_exchange_strong(expected, true,
+		std::memory_order_acq_rel, std::memory_order_relaxed))
+		return;
+
+	std::thread([]() {
+		using namespace std::chrono_literals;
+
+		// 둘 다 Servo ON 될 때까지 계속 폴링
+		while (true) {
+			bool s1 = IsAxisServoOn(1);
+			bool s2 = IsAxisServoOn(2);
+
+			if (s1 && s2) {
+				g_servo12Ready.store(true, std::memory_order_release);
+				//AppendLog(L"[STATE] ServoGate OPEN: Axis1&2 Servo ON confirmed -> commands enabled");
+				break;
+			}
+
+			// 너무 로그가 많으면 부담이라 200ms 정도 추천
+			std::this_thread::sleep_for(200ms);
+		}
+
+		g_servo12MonRunning.store(false, std::memory_order_release);
+		}).detach();
+}
+
+// 공통 게이트 체크(모션/그립 명령 앞단에서 사용)
+inline bool BlockIfServoNotReady(unsigned char cmd)
+{
+	if (!g_servo12Ready.load(std::memory_order_acquire)) {
+		wchar_t msg[128];
+		swprintf_s(msg, L"[BLOCK] 0x%02X ignored: Axis1/2 Servo ON not confirmed yet", (unsigned)cmd);
+		//AppendLog(msg);
+
+		LatchDemoAlarm(SERVO_ALM);
+
+		// PLC 대기 방지용 ACK (원치 않으면 제거 가능하지만, PLC가 멈추는 경우가 많음)
+		SendSimpleAck(g_clientSock, cmd);
+		return true; // “처리 완료(동작 없음)”
+	}
+	return false;
+}
 
 unsigned char CalcPosGripCode()
 {
@@ -2747,6 +2799,7 @@ void TcpServerThreadProc()
 			{
 				AppendLog(L"[INFO] PLC -> PC : Load Request");
 
+
 				if (g_stop29Latched.load(std::memory_order_acquire)) {
 					AppendLog(L"[BLOCK] 0x21 ignored: Stop29 latch is ON (wait Reset 0xFD)");
 					SendSimpleAck(g_clientSock, 0x21);
@@ -2912,6 +2965,9 @@ void TcpServerThreadProc()
 				//DoStopAll(nullptr);
 				g_cm.ExecEStop(EStopLevel::Final);
 				
+				g_servo12Ready.store(false, std::memory_order_release);
+				AppendLog(L"[STATE] ServoGate CLOSED (Stop): commands will be ignored until Reset+ServoOn confirmed");
+
 
 				AppendLog(L"[ACT] All axes QuickStop executed");
 
@@ -2952,6 +3008,11 @@ void TcpServerThreadProc()
 				AppendLog(L"[INFO] PLC -> PC : Reset Request");
 
 				g_cm.ReleaseEStop();
+
+				// ★ Reset 시작: 일단 명령 게이트 닫기
+				g_servo12Ready.store(false, std::memory_order_release);
+				AppendLog(L"[STATE] ServoGate CLOSED (Reset): wait Axis1&2 Servo ON confirm");
+
 
 				// ★ Reset 들어오면 Stop 라치 OFF (다시 명령 허용)
 				g_stop29Latched.store(false, std::memory_order_release);
@@ -3013,6 +3074,9 @@ void TcpServerThreadProc()
 					}
 				}
 
+				// ★ 마지막: Servo ON 확인 모니터 시작(둘 다 ON 될 때까지 계속 확인)
+				StartServo12ReadyMonitor();
+
 				return true;
 			}
 				// ---------------- COMM OPEN ----------------
@@ -3029,6 +3093,8 @@ void TcpServerThreadProc()
 				// ---------------- TRAVEL (Axis0) ----------------
 			case 0x2A: // 주행 포지션 기동
 			{
+				if (BlockIfServoNotReady(0x2A)) return true;
+
 				if (g_stop29Latched.load(std::memory_order_acquire)) {
 					AppendLog(L"[BLOCK] 0x2A ignored: Stop29 latch is ON (wait Reset 0xFD)");
 					SendSimpleAck(g_clientSock, 0x2A);
@@ -3123,6 +3189,8 @@ void TcpServerThreadProc()
 			// ---------------- HOIST (Axis2) ----------------
 			case 0x2B: // 상하 포지션 기동
 			{
+				if (BlockIfServoNotReady(0x2B)) return true;
+
 				if (g_stop29Latched.load(std::memory_order_acquire)) {
 					AppendLog(L"[BLOCK] 0x2B ignored: Stop29 latch is ON (wait Reset 0xFD)");
 					SendSimpleAck(g_clientSock, 0x2B);
@@ -3233,6 +3301,8 @@ void TcpServerThreadProc()
 			// ---------------- GRIP ----------------
 			case 0x2C: // 그립 포지션 기동
 			{
+				if (BlockIfServoNotReady(0x2C)) return true;
+
 				if (g_stop29Latched.load(std::memory_order_acquire)) {
 					AppendLog(L"[BLOCK] 0x2C ignored: Stop29 latch is ON (wait Reset 0xFD)");
 					SendSimpleAck(g_clientSock, 0x2C);   // PLC 대기 방지용
@@ -3342,6 +3412,8 @@ void TcpServerThreadProc()
 			case 0x2F:
 			{
 				AppendLog(L"[INFO] PLC -> PC : Drive Ready Request (0x2F)");
+
+				if (BlockIfServoNotReady(0x2F)) return true;
 
 				if (g_stop29Latched.load(std::memory_order_acquire)) {
 					AppendLog(L"[BLOCK] 0x2F ignored: Stop29 latch is ON (wait Reset 0xFD)");
