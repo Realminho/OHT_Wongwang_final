@@ -108,6 +108,7 @@ extern inline bool IsAxis2LimitOn();
 enum class TaskId : int {
     GoWorkstation = 0,
     GoConveyor,
+    GoMaintenance,
     LiftUp,
     WorkDown,
     ConveyorDown,
@@ -128,6 +129,7 @@ const TCHAR* TaskName(TaskId id) {
     switch (id) {
     case TaskId::GoWorkstation:      return TEXT("Workstation");
     case TaskId::GoConveyor:         return TEXT("Conveyor");
+    case TaskId::GoMaintenance:      return TEXT("Maintenance");
     case TaskId::LiftUp:             return TEXT("Lift Up");
     case TaskId::WorkDown:           return TEXT("Work Down");
     case TaskId::ConveyorDown:       return TEXT("Conveyor Down");
@@ -1390,6 +1392,21 @@ bool IsAxis0AtWorkstationBarcode()
     return std::llabs(diff) <= bcEps;
 }
 
+// 축0 바코드가 Workstation 위치에 있는지 확인 (0x6063 값 기준)
+bool IsAxis0AtMaintenanceBarcode()
+{
+    // GO_Conveyor()에서 사용한 타겟 바코드 값과 동일하게 맞춰줌
+    const long long targetBc = 510000;   // GO_Conveyor 의 targetBarcodeAbs
+    const int bcEps = 5;                 // 허용 오차 (필요시 조정)
+
+    int nowBc = 0;
+    if (!ReadAxis_TxPDO_6063(kAxisSlaveId[0], nowBc))
+        return false;
+
+    long long diff = (long long)nowBc - targetBc;
+    return std::llabs(diff) <= bcEps;
+}
+
 bool IsAxis0AtConveyorBarcodeStopped()
 {
     if (!IsAxis0AtConveyorBarcode())
@@ -1412,6 +1429,16 @@ bool IsAxis0AtWorkstationBarcodeStopped()
     return v <= 1.0;
 }
 
+bool IsAxis0AtMaintenanceBarcodeStopped()
+{
+    if (!IsAxis0AtMaintenanceBarcode())
+        return false;
+
+    CoreMotionStatus st{};
+    g_cm.GetStatus(&st);
+    double v = std::fabs(st.axesStatus[1].actualVelocity);
+    return v <= 1.0;
+}
 
 // 축2가 Up 위치(0 근처)인지 확인
 bool IsAxis2Up()
@@ -1437,7 +1464,7 @@ bool IsAxis2Workdown()
     CoreMotionStatus st{};
     g_cm.GetStatus(&st);
 
-    const long long targetPos = 45000;       // DoUp()에서 사용하는 타겟
+    const long long targetPos = 43823;       // DoUp()에서 사용하는 타겟
     const double posEps = 10.0;          // 위치 허용 오차
     const double velEps = 1.0;           // 속도 허용 오차
 
@@ -1455,7 +1482,7 @@ bool IsAxis2Conveyordown()
     CoreMotionStatus st{};
     g_cm.GetStatus(&st);
 
-    const long long targetPos = 51910;       // DoUp()에서 사용하는 타겟
+    const long long targetPos = 50442;       // DoUp()에서 사용하는 타겟
     const double posEps = 10.0;          // 위치 허용 오차
     const double velEps = 1.0;           // 속도 허용 오차
 
@@ -1746,7 +1773,7 @@ void DoGripServoOff_Compat(HWND hWnd) {
 void WorkDown() {
     if (!g_commStarted) { SetTaskState(TaskId::WorkDown, TaskState::Failed); return; }
     int ax = 2;
-    long long tgt = 45000;
+    long long tgt = 43822;
     StartMoveWithApproach(ax, tgt, TaskId::WorkDown,
         10000.0, 1000.0, 1500.0,
         10.0, 2.0, 15000,
@@ -1755,7 +1782,7 @@ void WorkDown() {
 void ConveyorDown() {
     if (!g_commStarted) { SetTaskState(TaskId::ConveyorDown, TaskState::Failed); return; }
     int ax = 2;
-    long long tgt = 51910;
+    long long tgt = 50442;
     StartMoveWithApproach(ax, tgt, TaskId::ConveyorDown,
         10000.0, 1000.0, 1500.0,
         10.0, 2.0, 30000,
@@ -1801,6 +1828,18 @@ void GO_Conveyor() {
     p.deadband = 2;
     p.gear = 4.3; p.wheelDia = 70.0; p.motorCpr = 10000.0; p.bcMmPerCnt = 0.1;
     g_bcRunner.Start(p, TaskId::GoConveyor);
+}
+void Go_Maintenance() {
+    if (!g_commStarted) { SetTaskState(TaskId::GoMaintenance, TaskState::Failed); return; }
+    BarcodeParams p{};
+    p.bcAxis = 0;          // ✅ 바코드 읽기축
+    p.moveAxis = 1;        // ✅ 주행축
+    p.targetBarcodeAbs = 507900;
+    p.mainVel = 15000.0; p.mainAcc = 1000.0; p.mainDec = 3000.0;
+    p.corrVel = 1000.0; p.corrAcc = 1000.0; p.corrDec = 2000.0;
+    p.deadband = 2;
+    p.gear = 4.3; p.wheelDia = 70.0; p.motorCpr = 10000.0; p.bcMmPerCnt = 0.1;
+    g_bcRunner.Start(p, TaskId::GoMaintenance);
 }
 
 // 원점 with Box 시퀀스
@@ -2161,8 +2200,8 @@ void StartDemoLoad()
             DoClose_Compat(g_hDemoWnd);
 
             // Load의 목적은 "박스를 잡는 것"이므로 HasBox()를 기준으로 대기
-            bool gotBox = WaitUntil(HasBox, 5000);
-            bool closedIdle = WaitUntil(IsGripperClosedAndIdle, 5000);
+            bool gotBox = WaitUntil(HasBox, 8000);
+            bool closedIdle = WaitUntil(IsGripperClosedAndIdle, 8000);
 
             if (!gotBox || !closedIdle) {
                 ok = false;
@@ -2324,8 +2363,8 @@ void StartDemoUnload()
 			DoGripServoOff_Compat(g_hDemoWnd); // Servo ON
             //Sleep(100);
             DoOpen_Compat(g_hDemoWnd);
-            bool released = WaitUntil(NoBox, 5000);
-            bool openIdle = WaitUntil(IsGripperOpenAndIdle, 5000);
+            bool released = WaitUntil(NoBox, 8000);
+            bool openIdle = WaitUntil(IsGripperOpenAndIdle, 8000);
 
             if (!released) {
                 ok = false;
@@ -2384,7 +2423,8 @@ enum : int {
     ID_BTN_DEMO_Work_WITH_BOX,
     ID_BTN_DEMO_Work_WITHOUT_BOX,
     ID_BTN_DEMO_LOAD,
-    ID_BTN_DEMO_UNLOAD
+    ID_BTN_DEMO_UNLOAD,
+    ID_BTN_MAINTENANCE
 };
 
 static void CreateStatusArea(HWND h, int x, int y, int w, int hgt) {
@@ -2486,6 +2526,9 @@ static void CreateRightDemoUI(HWND h, int x, int y, int w, int hgt)
     CreateWindow(TEXT("BUTTON"), TEXT("Conveyor"),
         WS_CHILD | WS_VISIBLE,
         x + 180, yCursor + 40, 140, 32, h, (HMENU)ID_BTN_CONVEYOR, 0, 0);
+    CreateWindow(TEXT("BUTTON"), TEXT("Maintenance"),
+        WS_CHILD | WS_VISIBLE,
+        x + 340, yCursor + 40, 140, 32, h, (HMENU)ID_BTN_MAINTENANCE, 0, 0);
     yCursor += grpH1 + 12;
 
     // Lift / Down 그룹
@@ -2569,7 +2612,7 @@ static void CreateRightDemoUI(HWND h, int x, int y, int w, int hgt)
         ID_BTN_WORKSTATION, ID_BTN_CONVEYOR, ID_BTN_UP,
             ID_BTN_WORK_DOWN, ID_BTN_CONVEYOR_DOWN, ID_BTN_STOP_ALL,
             ID_BTN_DEMO_HOME_WITH_BOX, ID_BTN_DEMO_HOME_WITHOUT_BOX,
-            ID_BTN_DEMO_LOAD, ID_BTN_DEMO_UNLOAD }) {
+            ID_BTN_DEMO_LOAD, ID_BTN_DEMO_UNLOAD, ID_BTN_MAINTENANCE }) {
         HWND b = GetDlgItem(h, id);
         if (b) SendMessage(b, WM_SETFONT, (WPARAM)hBtn, TRUE);
     }
@@ -2700,6 +2743,7 @@ static LRESULT CALLBACK DemoWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         switch (id) {
         case ID_BTN_WORKSTATION:          Go_Workstation();       return 0;
         case ID_BTN_CONVEYOR:             GO_Conveyor();          return 0;
+        case ID_BTN_MAINTENANCE:          Go_Maintenance();          return 0;
         case ID_BTN_UP:                   DoUp();                 return 0;
         case ID_BTN_WORK_DOWN:            WorkDown();             return 0;
         case ID_BTN_CONVEYOR_DOWN:        ConveyorDown();         return 0;

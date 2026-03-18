@@ -31,6 +31,7 @@ void StopAxis(int axis);
 
 bool IsAxis0AtConveyorBarcode();
 bool IsAxis0AtWorkstationBarcode();
+bool IsAxis0AtMaintenanceBarcode();
 bool IsAxis2Up();
 bool IsAxis2Workdown();
 bool IsAxis2Conveyordown();
@@ -62,6 +63,7 @@ extern "C" int RunGPIOWindowExternal(HINSTANCE hInst);
 enum class TaskId : int {
     GoWorkstation = 0,
     GoConveyor,
+    GoMaintenance,
     LiftUp,
     WorkDown,
     ConveyorDown,

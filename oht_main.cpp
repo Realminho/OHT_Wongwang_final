@@ -185,6 +185,7 @@ static void StopJogIfActive();
 
 extern void GO_Conveyor();     // Conveyor 버튼이 눌렸을 때 실행되는 함수
 extern void Go_Workstation();  // Workstation 버튼이 눌렸을 때 실행되는 함수
+extern void Go_Maintenance();
 extern void ConveyorDown();    // Conveyor Down 버튼
 extern void WorkDown();        // Work Down 버튼
 extern void DoUp();            // Up 버튼
@@ -1323,6 +1324,7 @@ inline unsigned char CalcPosTravelCode()
 	if (!ReadAxis0_TxPDO_6063(bc)) return 0x00;
 	if (std::llabs((long long)bc - 476774) <= 10) return 0x01; // Load
 	if (std::llabs((long long)bc - 491332) <= 10) return 0x02; // Unload
+	if (std::llabs((long long)bc - 507900) <= 10) return 0x03; // Maintenance
 	return 0x00;
 }
 
@@ -1344,20 +1346,20 @@ static bool CanAxis2Move_Auto()
 {
 	// 요구: 주행 위치가 Load/Unload 위치일 때만 Axis2 동작 가능
 	unsigned char code = CalcPosTravelCode();
-	return (code == 0x01 || code == 0x02);
+	return (code == 0x01 || code == 0x02 || code == 0x03);
 }
 
 static bool CanAxis2Move_Auto_RequireTravel(unsigned char requiredCode)
 {
 	unsigned char code = CalcPosTravelCode();
-	if (code != requiredCode) {
-		wchar_t s[128];
-		swprintf_s(s, L"[INTERLOCK] Axis2 blocked: TravelCode=0x%02X, required=0x%02X",
-			(unsigned)code, (unsigned)requiredCode);
-		//AppendLog(s);
-		return false;
+
+	if (requiredCode == 0x01) {
+		return (code == 0x01 || code == 0x03);
 	}
-	return true;
+	if (requiredCode == 0x02) {
+		return (code == 0x02 || code == 0x03);
+	}
+	return (code == requiredCode);
 }
 
 
@@ -2029,6 +2031,7 @@ enum : unsigned char
 	DEMO_ALM_TRAVEL_INVALID_POS = 0x43,
 	DEMO_ALM_TRAVEL_TO_CONVEYOR_TO = 0x44,
 	DEMO_ALM_TRAVEL_TO_WORK_TO = 0x45,
+	DEMO_ALM_TRAVEL_TO_Maintenance_TO = 0x46,
 
 	// ---- HOIST(0x2B): 0x50~0x5F
 	DEMO_ALM_HOIST_INTERLOCK_FAIL = 0x50,
@@ -2075,8 +2078,8 @@ static unsigned char CalcPosHoistCode()
 	if (!g_commStarted) return 0x00;
 	g_cm.GetStatus(&g_status);
 	long long p = (long long)g_status.axesStatus[2].actualPos;
-	if (BetweenTol(p, 51910, 10)) return 0x01;
-	if (BetweenTol(p, 45000, 10)) return 0x02;
+	if (BetweenTol(p, 50442, 10)) return 0x01;
+	if (BetweenTol(p, 43822, 10)) return 0x02;
 	if (BetweenTol(p, 0, 10))     return 0x03;
 	return 0x00;
 }
@@ -3163,9 +3166,15 @@ void TcpServerThreadProc()
 						ToggleDO_HW(11, false, nullptr);
 						break;
 					case 3:
+						AppendLog(L"[ACT] Travel Pos3 -> Maintenance");
+						ToggleDO_HW(11, true, nullptr);
+						Go_Maintenance();
+						okTravel = WaitTaskFinished(TaskId::GoMaintenance, 30000);
+						AppendLog(okTravel
+							? L"[ACT] Travel Pos3 -> Maintenace DONE"
+							: L"[ACT] Travel Pos3 -> Maintenance FAILED or TIMEOUT");
+						if (!okTravel) LatchDemoAlarm(DEMO_ALM_TRAVEL_TO_Maintenance_TO); // ★ NEW
 						ToggleDO_HW(11, false, nullptr);
-						AppendLog(L"[WARN] Travel Pos3 not implemented");
-						okTravel = false;
 						break;
 					default:
 						ToggleDO_HW(11, false, nullptr);
@@ -3341,7 +3350,7 @@ void TcpServerThreadProc()
 
 					switch (posNo) {
 					case 1: // Open
-						if (HasBox()) {
+						if (g_autoMode.load() && HasBox()) {
 							AppendLog(L"[INTERLOCK] Grip Open blocked: HasBox()==true");
 							break;
 						}
