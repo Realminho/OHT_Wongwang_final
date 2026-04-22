@@ -710,9 +710,9 @@ static void Axis2HomeSoftDecelTo500() {
     CoreMotionStatus st{}; g_cm.GetStatus(&st);
     long long cur = (long long)st.axesStatus[2].actualPos;
     int dir = Axis2CurrentDir(); if (dir == 0) dir = +1;
-    long long smallStep = 5000 * dir;
+    long long smallStep = 100000 * dir;
     long long softTarget = cur + smallStep;
-    double newVel = 500.0;
+    double newVel = 10000.0;
     double accMs = 80.0;
     double decMs = 10.0;
     Motion::PosCommand pc{};
@@ -1773,27 +1773,41 @@ void DoGripServoOff_Compat(HWND hWnd) {
 void WorkDown() {
     if (!g_commStarted) { SetTaskState(TaskId::WorkDown, TaskState::Failed); return; }
     int ax = 2;
-    long long tgt = 43822;
+    /*long long tgt = 43822;
     StartMoveWithApproach(ax, tgt, TaskId::WorkDown,
         10000.0, 1000.0, 1500.0,
         10.0, 2.0, 15000,
-        3000.0, { 1000.0, 80.0, 10.0 });
+        3000.0, { 1000.0, 80.0, 10.0 });*/
+    long long tgt = 340000;
+    StartMoveWithApproach(ax, tgt, TaskId::WorkDown,
+        200000.0, 1000.0, 1500.0,
+        100.0, 10.0, 15000,
+        3000.0, { 10000.0, 500.0, 500.0 });
 }
 void ConveyorDown() {
     if (!g_commStarted) { SetTaskState(TaskId::ConveyorDown, TaskState::Failed); return; }
     int ax = 2;
-    long long tgt = 50442;
+    /*long long tgt = 50442;
     StartMoveWithApproach(ax, tgt, TaskId::ConveyorDown,
         10000.0, 1000.0, 1500.0,
         10.0, 2.0, 30000,
-        3500, { 1000.0, 80.0, 10.0 });
+        3500, { 1000.0, 80.0, 10.0 });*/
+    long long tgt = 340000;
+    StartMoveWithApproach(ax, tgt, TaskId::ConveyorDown,
+        200000.0, 1000.0, 1500.0,
+        100.0, 10.0, 30000,
+        3500, { 10000.0, 500.0, 500.0 });
 }
 void DoUp() {
     if (!g_commStarted) { SetTaskState(TaskId::LiftUp, TaskState::Failed); return; }
     int ax = 2; long long tgt = 0;
     // 필드 순서: axis, target, task, velEps, posEps, timeoutMs, treatStoppedAsDone
-    MoveMonitorArgs m{ ax, tgt, TaskId::LiftUp, 10.0, 2.0, 15000, true };
-    StartMoveAndMonitor(m, 10000.0, 3000.0, 3000.0);
+    //MoveMonitorArgs m{ ax, tgt, TaskId::LiftUp, 10.0, 2.0, 15000, true };
+    //StartMoveAndMonitor(m, 10000.0, 3000.0, 3000.0);
+    StartMoveWithApproach(ax, tgt, TaskId::LiftUp,
+        200000.0, 3000.0, 3000.0,
+        100.0, 10.0, 30000,
+        13000, { 10000.0, 800.0, 800.0 });
 }
 void DoStopAll(HWND hWnd) {
     DoGripServoOff_Compat(hWnd);
