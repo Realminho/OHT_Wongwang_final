@@ -489,11 +489,11 @@ static void Axis2HomeSoftDecelTo500() {
 	if (dir == 0) dir = +1; // 정지에 가까우면 +쪽으로 소폭
 
 	// 가까운 소타겟으로 감속: 2만 펄스 앞(또는 뒤) 지점
-	long long smallStep = 5000 * dir;
+	long long smallStep = 100000 * dir;
 	long long softTarget = cur + smallStep;
 
 	// 감속을 빠르게: Dec 시간을 짧게(예: 30ms), 목표속도 5000pps로 전환
-	double newVel = 500.0; // 요청사항
+	double newVel = 10000.0; // 요청사항
 	double accMs = 80.0;
 	double decMs = 10.0;
 
@@ -1931,6 +1931,26 @@ static bool SetAxisGearRatio(int axis, double numerator, double denominator) {
 	return true;
 }
 
+static bool SetAbsoluteEncoder(int axis, bool flag) {
+	if (!g_commStarted) return false;
+	long err = g_cm.config->SetAbsoluteEncoderMode(axis, flag);
+	if (err != ErrorCode::None) {
+		ShowErrMsgBox(TEXT("AbsoluteEncoderMode 실패"), err, g_wmx);
+		return false;
+	}
+	return true;
+}
+
+static bool SetAbsoluteOffset(int axis, double offset) {
+	if (!g_commStarted) return false;
+	long err = g_cm.config->SetAbsoluteEncoderHomeOffset(axis, offset);
+	if (err != ErrorCode::None) {
+		ShowErrMsgBox(TEXT("SetAbsoluteEncoderHomeOffset 실패"), err, g_wmx);
+		return false;
+	}
+	return true;
+}
+
 static bool StartComm() {
 	if (!g_deviceOpened) {
 		// 장치가 없으면 먼저 InitDevice
@@ -1959,6 +1979,9 @@ static bool StartComm() {
 	SetAxisGearRatio(0, 43000.0, 10000.0);
 	SetAxisGearRatio(1, 43000.0, 10000.0);
 	SetAxisGearRatio(2, 100000.0, 10000.0);
+	
+	SetAbsoluteEncoder(2, true); // Axis2 절대 엔코더 모드
+	SetAbsoluteOffset(2, 0); // Axis2 절대 오프셋
 
 	// Axis2 sensor flags reset
 	g_ax2LimitOn = false;
@@ -3500,7 +3523,7 @@ void TcpServerThreadProc()
 						bool started = StartAbsMoveWithProfile(
 							2,          // axis
 							-1000,      // target position
-							3000.0,     // velocity
+							10000.0,     // velocity
 							1000.0,     // tAcc (ms)
 							1000.0      // tDec (ms)
 						);
@@ -6794,7 +6817,7 @@ static void AutoStart(HWND hWnd)
 	}
 
 	// Servo ON
-	/*for (int a = 0; a < 4; ++a) {
+	/*for (int a = 0; a < 2; ++a) {
 		EnsureServoOn(a);
 		EnsurePosModeNoStop(a);
 	}*/
@@ -6820,9 +6843,9 @@ static void AutoStart(HWND hWnd)
 	//// Sync Group 0: Master=0, Slave=[1]
 	//if (g_commStarted) {
 	//	Sync::SyncGroup grp{};
-	//	grp.masterAxis = 0;
+	//	grp.masterAxis = 1;              // 기존 0 -> 1
 	//	grp.slaveAxisCount = 1;
-	//	grp.slaveAxis[0] = 1;
+	//	grp.slaveAxis[0] = 0;            // 기존 1 -> 0
 	//	grp.servoOnOffSynchronization = 1;
 	//	grp.startupType = Sync::SyncGroupStartupType::Normal;
 	//	grp.gantryLoopCycleRatio = 1;
@@ -6841,6 +6864,7 @@ static void AutoStart(HWND hWnd)
 	//	long se = g_cm.sync->SetSyncGroup(0, grp);
 	//	if (se == ErrorCode::None) {
 	//		Sleep(10);
+
 	//		Config::SyncParam sp{};
 	//		if (g_cm.config->GetSyncParam(grp.masterAxis, &sp) == ErrorCode::None) {
 	//			sp.masterDesyncDec = 10000.0;
@@ -6848,6 +6872,7 @@ static void AutoStart(HWND hWnd)
 	//			g_cm.config->SetSyncParam(grp.masterAxis, &sp, nullptr);
 	//			Sleep(10);
 	//		}
+
 	//		g_cm.sync->EnableSyncGroup(0, 1);
 	//	}
 	//}
@@ -6918,13 +6943,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			// 1) UI/서비스 준비 시간
 			std::this_thread::sleep_for(std::chrono::seconds(1));
 			AutoStart(hMain);
-
+			
 			std::this_thread::sleep_for(std::chrono::seconds(1));
 			DoGripServoOff_Compat(hMain);
 
 			// 2) AutoStart 후 TCP 시작
 			StartTcpServer();
 			std::this_thread::sleep_for(std::chrono::seconds(1));
+
+			std::this_thread::sleep_for(std::chrono::seconds(1));
+			g_home.StartHome(1);      // Home → pos=0 리셋
 
 			//// 3) 그리퍼 상태 정리 (HasBox 기준)
 			//bool okGrip = false;

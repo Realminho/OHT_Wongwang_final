@@ -484,7 +484,6 @@ static void StartMoveWithApproach(int axis, long long target, TaskId task,
         return;
     }
 
-    // 1) 먼저 target까지 "빠른" 프로파일로 이동 시작 (5000 등)
     Motion::PosCommand fast{};
     fast.axis = axis;
     fast.profile.type = ProfileType::SCurve;
@@ -501,10 +500,6 @@ static void StartMoveWithApproach(int axis, long long target, TaskId task,
 
     SetTaskState(task, TaskState::Running);
 
-    // 2) 모니터링 스레드: 3단계 상태
-    //   - phase 0 : 빠른 구간 (그냥 감시만)
-    //   - phase 1 : Axis2HomeSoftDecelTo500 패턴으로 "급 감속용 소타겟" 이동
-    //   - phase 2 : 저속(1000)으로 최종 target 접근
     std::thread([=]() {
         DWORD startTick = GetTickCount();
         CoreMotionStatus st{};
@@ -513,14 +508,13 @@ static void StartMoveWithApproach(int axis, long long target, TaskId task,
         enum Phase { FastRun = 0, SoftDecel, FinalApproach };
         Phase phase = FastRun;
 
-        long long softTarget = 0;   // 급감속용 중간 타겟
+        long long softTarget = 0;
         bool softTargetSet = false;
 
         while (true) {
-            // ★★★ 1) 전역 Stop(DoStopAll 등) 감지: task가 Running이 아니면 즉시 종료
             TaskState cur = g_taskStatus[(int)task].state.load(std::memory_order_relaxed);
             if (cur == TaskState::Stopped || cur == TaskState::Failed) {
-                result = cur;   // 보통 Stopped
+                result = cur;   // 진짜 외부 중단/실패만 여기서 반영
                 break;
             }
 
@@ -537,48 +531,35 @@ static void StartMoveWithApproach(int axis, long long target, TaskId task,
             double remErr = std::fabs((double)target - actPos);
 
             if (phase == FastRun) {
-                // 아직 빠른 구간: 남은 거리 remErr 를 체크
-                // remErr <= approachEps (예: 3500) 이 되면
-                // Axis2HomeSoftDecelTo500 스타일로 "현재 위치 기준 소타겟"으로 급감속
                 if (remErr <= approachEps) {
-                    // 현재 위치, 진행 방향 계산
-                    long long cur = (long long)axst.actualPos;
-                    long long dist = target - cur;
+                    long long curPos = (long long)axst.actualPos;
+                    long long dist = target - curPos;
+
                     if (dist == 0) {
-                        // 이미 타겟 가까우면 바로 종료 처리
-                        if (actVel < velEps && remErr <= posEps) {
-                            result = TaskState::Done;
-                        }
-                        else {
-                            result = TaskState::Stopped;
-                        }
+                        result = TaskState::Done;   // 여기서는 완료 처리
                         break;
                     }
 
                     int dir = (dist > 0) ? +1 : -1;
 
-                    // Axis2HomeSoftDecelTo500 처럼 "현재 위치에서 작은 step" 만큼
-                    // 앞쪽으로 소타겟 잡기. (여기서는 remErr의 절반 정도, 최대 4000 제한)
-                    long long maxStep = 4000;  // 필요하면 조정
+                    long long maxStep = 4000;
                     long long step = (long long)remErr / 2;
                     if (step > maxStep) step = maxStep;
-                    if (step < 1000)   step = 1000;  // 너무 짧으면 감속 효과가 약하니 최소값
+                    if (step < 1000)    step = 1000;
 
                     step *= dir;
-                    softTarget = cur + step;
+                    softTarget = curPos + step;
 
-                    // 혹시 소타겟이 target 을 넘어가지 않도록 보정
                     if (dir > 0 && softTarget > target) softTarget = target;
                     if (dir < 0 && softTarget < target) softTarget = target;
 
-                    // === 1단계 급감속: Axis2HomeSoftDecelTo500 과 같은 방식 ===
                     Motion::PosCommand pc{};
                     pc.axis = axis;
                     pc.target = softTarget;
                     pc.profile.type = ProfileType::SCurve;
-                    pc.profile.velocity = (int)std::lround(ap.vpps); // 최종에서 쓸 저속과 비슷하게
+                    pc.profile.velocity = (int)std::lround(ap.vpps);
                     pc.profile.acc = TimeMsToAcc(pc.profile.velocity, ap.accMs);
-                    pc.profile.dec = TimeMsToAcc(pc.profile.velocity, ap.decMs); // decMs 작은 값으로 "확" 감속
+                    pc.profile.dec = TimeMsToAcc(pc.profile.velocity, ap.decMs);
 
                     g_cm.motion->StartPos(&pc);
 
@@ -587,20 +568,14 @@ static void StartMoveWithApproach(int axis, long long target, TaskId task,
                 }
             }
             else if (phase == SoftDecel) {
-                // 급감속 소타겟(softTarget)으로 가는 중
-                // 속도가 충분히 줄고, softTarget 근처에 오면 → 최종 타겟으로 저속 접근 시작
                 double eSoft = 0.0;
                 if (softTargetSet)
                     eSoft = std::fabs((double)softTarget - actPos);
 
-                // "충분히 감속되었다" 판단 기준:
-                //  - 속도 actVel 이 ap.vpps 근처 or 매우 낮아졌을 때
-                //  - 소타겟 근처(eSoft <= posEps * 2 정도)
                 if (softTargetSet &&
-                    actVel <= (ap.vpps + 50.0) &&     // 속도 기준 (적당히 여유)
+                    actVel <= (ap.vpps + 50.0) &&
                     eSoft <= (posEps * 2.0))
                 {
-                    // === 2단계: 이제 저속(1000)으로 최종 target까지 이동 ===
                     Motion::PosCommand pc2{};
                     pc2.axis = axis;
                     pc2.target = target;
@@ -614,14 +589,8 @@ static void StartMoveWithApproach(int axis, long long target, TaskId task,
                 }
             }
             else if (phase == FinalApproach) {
-                // 최종 저속 접근 단계: 평소처럼 Done/Stopped 판정
                 if (actVel < velEps) {
-                    if (remErr <= posEps) {
-                        result = TaskState::Done;
-                    }
-                    else {
-                        result = TaskState::Stopped;
-                    }
+                    result = TaskState::Done;   // 여기 핵심
                     break;
                 }
             }
@@ -1366,7 +1335,8 @@ void ToggleDO_HW(int pin, bool turnOn, HWND hWnd)
 bool IsAxis0AtConveyorBarcode()
 {
     // GO_Conveyor()에서 사용한 타겟 바코드 값과 동일하게 맞춰줌
-    const long long targetBc = 476774;   // GO_Conveyor 의 targetBarcodeAbs
+    //const long long targetBc = 476774;   // GO_Conveyor 의 targetBarcodeAbs
+	const long long targetBc = 526608;   // GO_Conveyor 의 targetBarcodeAbs
     const int bcEps = 5;                 // 허용 오차 (필요시 조정)
 
     int nowBc = 0;
@@ -1381,7 +1351,8 @@ bool IsAxis0AtConveyorBarcode()
 bool IsAxis0AtWorkstationBarcode()
 {
     // GO_Conveyor()에서 사용한 타겟 바코드 값과 동일하게 맞춰줌
-    const long long targetBc = 491332;   // GO_Conveyor 의 targetBarcodeAbs
+    //const long long targetBc = 491332;   // GO_Conveyor 의 targetBarcodeAbs
+    const long long targetBc = 537813;
     const int bcEps = 5;                 // 허용 오차 (필요시 조정)
 
     int nowBc = 0;
@@ -1464,7 +1435,8 @@ bool IsAxis2Workdown()
     CoreMotionStatus st{};
     g_cm.GetStatus(&st);
 
-    const long long targetPos = 43823;       // DoUp()에서 사용하는 타겟
+    //const long long targetPos = 43823;       // DoUp()에서 사용하는 타겟
+    const long long targetPos = 274833;       // DoUp()에서 사용하는 타겟
     const double posEps = 10.0;          // 위치 허용 오차
     const double velEps = 1.0;           // 속도 허용 오차
 
@@ -1482,7 +1454,8 @@ bool IsAxis2Conveyordown()
     CoreMotionStatus st{};
     g_cm.GetStatus(&st);
 
-    const long long targetPos = 50442;       // DoUp()에서 사용하는 타겟
+    //const long long targetPos = 50442;       // DoUp()에서 사용하는 타겟
+    const long long targetPos = 420331;       // DoUp()에서 사용하는 타겟
     const double posEps = 10.0;          // 위치 허용 오차
     const double velEps = 1.0;           // 속도 허용 오차
 
@@ -1778,11 +1751,11 @@ void WorkDown() {
         10000.0, 1000.0, 1500.0,
         10.0, 2.0, 15000,
         3000.0, { 1000.0, 80.0, 10.0 });*/
-    long long tgt = 340000;
+    long long tgt = 274833;
     StartMoveWithApproach(ax, tgt, TaskId::WorkDown,
-        200000.0, 1000.0, 1500.0,
+        200000.0, 1000.0, 4000.0,
         100.0, 10.0, 15000,
-        3000.0, { 10000.0, 500.0, 500.0 });
+        30000.0, { 20000.0, 500.0, 500.0 });
 }
 void ConveyorDown() {
     if (!g_commStarted) { SetTaskState(TaskId::ConveyorDown, TaskState::Failed); return; }
@@ -1792,11 +1765,11 @@ void ConveyorDown() {
         10000.0, 1000.0, 1500.0,
         10.0, 2.0, 30000,
         3500, { 1000.0, 80.0, 10.0 });*/
-    long long tgt = 340000;
+    long long tgt = 420331;
     StartMoveWithApproach(ax, tgt, TaskId::ConveyorDown,
-        200000.0, 1000.0, 1500.0,
+        200000.0, 1000.0, 4000.0,
         100.0, 10.0, 30000,
-        3500, { 10000.0, 500.0, 500.0 });
+        35000, { 20000.0, 500.0, 500.0 });
 }
 void DoUp() {
     if (!g_commStarted) { SetTaskState(TaskId::LiftUp, TaskState::Failed); return; }
@@ -1805,9 +1778,9 @@ void DoUp() {
     //MoveMonitorArgs m{ ax, tgt, TaskId::LiftUp, 10.0, 2.0, 15000, true };
     //StartMoveAndMonitor(m, 10000.0, 3000.0, 3000.0);
     StartMoveWithApproach(ax, tgt, TaskId::LiftUp,
-        200000.0, 3000.0, 3000.0,
+        200000.0, 3000.0, 2000.0,
         100.0, 10.0, 30000,
-        13000, { 10000.0, 800.0, 800.0 });
+        13000, { 10000.0, 500.0, 500.0 });
 }
 void DoStopAll(HWND hWnd) {
     DoGripServoOff_Compat(hWnd);
@@ -1824,8 +1797,9 @@ void Go_Workstation() {
     BarcodeParams p{};
     p.bcAxis = 0;          // ✅ 바코드 읽기축
     p.moveAxis = 1;        // ✅ 주행축
-    p.targetBarcodeAbs = 491332;
-    p.mainVel = 15000.0; p.mainAcc = 1000.0; p.mainDec = 3000.0;
+    //p.targetBarcodeAbs = 491332;
+	p.targetBarcodeAbs = 537813;
+    p.mainVel = 15000.0; p.mainAcc = 2000.0; p.mainDec = 3000.0;
     p.corrVel = 1000.0; p.corrAcc = 1000.0; p.corrDec = 2000.0;
     p.deadband = 2;
     p.gear = 4.3; p.wheelDia = 70.0; p.motorCpr = 10000.0; p.bcMmPerCnt = 0.1;
@@ -1836,8 +1810,9 @@ void GO_Conveyor() {
     BarcodeParams p{};
     p.bcAxis = 0;          // ✅ 바코드 읽기축
     p.moveAxis = 1;        // ✅ 주행축
-    p.targetBarcodeAbs = 476774;
-    p.mainVel = 15000.0; p.mainAcc = 1000.0; p.mainDec = 3000.0;
+    //p.targetBarcodeAbs = 476774;
+	p.targetBarcodeAbs = 526608;
+    p.mainVel = 15000.0; p.mainAcc = 2000.0; p.mainDec = 3000.0;
     p.corrVel = 1000.0; p.corrAcc = 1000.0; p.corrDec = 2000.0;
     p.deadband = 2;
     p.gear = 4.3; p.wheelDia = 70.0; p.motorCpr = 10000.0; p.bcMmPerCnt = 0.1;
@@ -1864,22 +1839,6 @@ void StartDemoHomeWithBox()
         return;
     }
 
-    // ★ 박스가 없으면 시퀀스 시작하지 않음
-    if (!HasBox()) {
-        SetTaskState(TaskId::DemoHomeWithBox, TaskState::Failed);
-
-        // 필요하면 안내 메시지도 가능
-        // if (g_hDemoWnd) {
-        //     MessageBox(g_hDemoWnd,
-        //         TEXT("원점 with Box 시퀀스를 시작할 수 없습니다.\n")
-        //         TEXT("조건: HasBox == TRUE (Catched ON)"),
-        //         TEXT("Demo Home(Box)"),
-        //         MB_ICONWARNING);
-        // }
-
-        return;
-    }
-
     if (g_taskStatus[(int)TaskId::DemoHomeWithBox].state.load() == TaskState::Running)
         return;
 
@@ -1888,52 +1847,187 @@ void StartDemoHomeWithBox()
     std::thread([]() {
         bool ok = true;
 
-        // 1. 그리퍼 Close (박스 잡기)  → Close 상태 될 때까지 대기
-        DoClose_Compat(g_hDemoWnd);
-        if (!WaitUntil(HasBox, 5000) || !WaitUntil(IsGripperClosedAndIdle, 5000))
-            ok = false;
-
-        // 2. 축2 Up  → Axis2 Up 상태까지 대기
         if (ok) {
-            DoUp();
-            if (!WaitUntil(IsAxis2Up, 20000))
+            ConveyorDown();
+            // 축2가 ConveyorDown 위치에 도달할 때까지 대기
+            if (!WaitUntil(IsAxis2Conveyordown, 20000)) {
                 ok = false;
+                LatchDemoAlarm(DEMO_ALM_LOAD_CONVEYORDOWN_TIMEOUT);
+            }
         }
 
-        // 3. Workstation 위치로 이동  → 바코드 기준 Workstation 도달까지 대기
+        // 2. 그리퍼 Close (박스 잡기)
+        if (ok) {
+            DoGripServoOff_Compat(g_hDemoWnd); // Servo ON
+            //Sleep(100);
+            DoClose_Compat(g_hDemoWnd);
+
+            // Load의 목적은 "박스를 잡는 것"이므로 HasBox()를 기준으로 대기
+            bool gotBox = WaitUntil(HasBox, 8000);
+            bool closedIdle = WaitUntil(IsGripperClosedAndIdle, 8000);
+
+            if (!gotBox || !closedIdle) {
+                ok = false;
+
+                // ★ 에러코드만 세팅 (동작은 그대로)
+                // 우선순위: HasBox 실패가 더 근본 원인인 경우가 많으니 먼저 라치
+                if (!gotBox) {
+                    LatchDemoAlarm(DEMO_ALM_LOAD_BOX_NOT_CAUGHT);
+                }
+                else if (!closedIdle) {
+                    LatchDemoAlarm(DEMO_ALM_LOAD_GRIP_CLOSE_TIMEOUT);
+                }
+
+                // ---- 이하 기존 동작 그대로 ----
+                if (!HasBox()) {
+                    bool Ok = true;
+
+                    // 박스가 없다면 Open 상태로 정리
+                    DoOpen_Compat(g_hDemoWnd);
+                    if (!WaitUntil(IsGripperOpenAndIdle, 5000)) {
+                        Ok = false;
+                        // (선택) 복구 실패도 찍고 싶으면. 첫 에러만 유지라면 Latch라 덮어쓰지 않음
+                        LatchDemoAlarm(DEMO_ALM_LOAD_REC_OPEN_TIMEOUT);
+                    }
+
+                    if (Ok) {
+                        DoUp();
+                        if (!WaitUntil(IsAxis2Up, 20000)) {
+                            Ok = false;
+                            // (선택)
+                            LatchDemoAlarm(DEMO_ALM_LOAD_REC_UP_TIMEOUT);
+                        }
+                    }
+                }
+            }
+
+        }
+
+        // 3. 축2 Up
+        if (ok) {
+            DoUp();
+            if (!WaitUntil(IsAxis2Up, 20000)) {
+                ok = false;
+                LatchDemoAlarm(DEMO_ALM_LOAD_UP_TIMEOUT);
+            }
+        }
+
+        // 1. Workstation 위치로 이동  → 바코드 기준 Workstation 도달까지 대기
         if (ok) {
             Go_Workstation();
             if (!WaitUntil(IsAxis0AtWorkstationBarcodeStopped, 30000))
                 ok = false;
         }
 
-        // 4. WorkDown (작업 위치로 하강)  → Axis2 WorkDown 도달까지 대기
+        // 2. WorkDown (작업 위치로 하강)  → Axis2 WorkDown 도달까지 대기
         if (ok) {
             WorkDown();
             if (!WaitUntil(IsAxis2Workdown, 20000))
                 ok = false;
         }
 
-        // 5. 그리퍼 Open (놓기)  → 그리퍼가 Open 출력 상태가 될 때까지 대기
+        // 3. 그리퍼 Open (놓기)  → 그리퍼가 Open 출력 상태가 될 때까지 대기
         if (ok) {
             DoOpen_Compat(g_hDemoWnd);
             if (!WaitUntil(NoBox, 5000) || !WaitUntil(IsGripperOpenAndIdle, 5000))
                 ok = false;
         }
 
-        // 6. 축2 Up  → 다시 Up 도달까지 대기
+        // 4. 축2 Up  → Axis2 Up 상태까지 대기
         if (ok) {
             DoUp();
             if (!WaitUntil(IsAxis2Up, 20000))
                 ok = false;
         }
 
-        // 7. Conveyor 위치로 이동  → 바코드 기준 Conveyor 도달까지 대기
+        if (ok) {
+            WorkDown();
+            if (!WaitUntil(IsAxis2Workdown, 20000))
+                ok = false;
+        }
+
+        // 2. 그리퍼 Close (박스 잡기)
+        if (ok) {
+            DoGripServoOff_Compat(g_hDemoWnd); // Servo ON
+            //Sleep(100);
+            DoClose_Compat(g_hDemoWnd);
+
+            // Load의 목적은 "박스를 잡는 것"이므로 HasBox()를 기준으로 대기
+            bool gotBox = WaitUntil(HasBox, 8000);
+            bool closedIdle = WaitUntil(IsGripperClosedAndIdle, 8000);
+
+            if (!gotBox || !closedIdle) {
+                ok = false;
+
+                // ★ 에러코드만 세팅 (동작은 그대로)
+                // 우선순위: HasBox 실패가 더 근본 원인인 경우가 많으니 먼저 라치
+                if (!gotBox) {
+                    LatchDemoAlarm(DEMO_ALM_LOAD_BOX_NOT_CAUGHT);
+                }
+                else if (!closedIdle) {
+                    LatchDemoAlarm(DEMO_ALM_LOAD_GRIP_CLOSE_TIMEOUT);
+                }
+
+                // ---- 이하 기존 동작 그대로 ----
+                if (!HasBox()) {
+                    bool Ok = true;
+
+                    // 박스가 없다면 Open 상태로 정리
+                    DoOpen_Compat(g_hDemoWnd);
+                    if (!WaitUntil(IsGripperOpenAndIdle, 5000)) {
+                        Ok = false;
+                        // (선택) 복구 실패도 찍고 싶으면. 첫 에러만 유지라면 Latch라 덮어쓰지 않음
+                        LatchDemoAlarm(DEMO_ALM_LOAD_REC_OPEN_TIMEOUT);
+                    }
+
+                    if (Ok) {
+                        DoUp();
+                        if (!WaitUntil(IsAxis2Up, 20000)) {
+                            Ok = false;
+                            // (선택)
+                            LatchDemoAlarm(DEMO_ALM_LOAD_REC_UP_TIMEOUT);
+                        }
+                    }
+                }
+            }
+
+        }
+
+        // 4. 축2 Up  → Axis2 Up 상태까지 대기
+        if (ok) {
+            DoUp();
+            if (!WaitUntil(IsAxis2Up, 20000))
+                ok = false;
+        }
+
+        // 5. Conveyor 위치로 이동  → 바코드 기준 Conveyor 도달까지 대기
         if (ok) {
             GO_Conveyor();
             if (!WaitUntil(IsAxis0AtConveyorBarcodeStopped, 30000))
                 ok = false;
         }
+
+        if (ok) {
+            ConveyorDown();
+            // 축2가 ConveyorDown 위치에 도달할 때까지 대기
+            if (!WaitUntil(IsAxis2Conveyordown, 20000)) {
+                ok = false;
+                LatchDemoAlarm(DEMO_ALM_LOAD_CONVEYORDOWN_TIMEOUT);
+            }
+        }
+
+        if (ok) {
+            DoOpen_Compat(g_hDemoWnd);
+            if (!WaitUntil(NoBox, 5000) || !WaitUntil(IsGripperOpenAndIdle, 5000))
+                ok = false;
+        }
+
+        if (ok) {
+            DoUp();
+            if (!WaitUntil(IsAxis2Up, 20000))
+                ok = false;
+        }
+
 
         SetTaskState(TaskId::DemoHomeWithBox, ok ? TaskState::Done : TaskState::Failed);
         }).detach();
