@@ -1753,7 +1753,7 @@ void WorkDown() {
         3000.0, { 1000.0, 80.0, 10.0 });*/
     long long tgt = 274833;
     StartMoveWithApproach(ax, tgt, TaskId::WorkDown,
-        200000.0, 1000.0, 4000.0,
+        300000.0, 1000.0, 6000.0,
         100.0, 10.0, 15000,
         30000.0, { 20000.0, 500.0, 500.0 });
 }
@@ -1767,7 +1767,7 @@ void ConveyorDown() {
         3500, { 1000.0, 80.0, 10.0 });*/
     long long tgt = 420331;
     StartMoveWithApproach(ax, tgt, TaskId::ConveyorDown,
-        200000.0, 1000.0, 4000.0,
+        300000.0, 1000.0, 6000.0,
         100.0, 10.0, 30000,
         35000, { 20000.0, 500.0, 500.0 });
 }
@@ -1778,7 +1778,7 @@ void DoUp() {
     //MoveMonitorArgs m{ ax, tgt, TaskId::LiftUp, 10.0, 2.0, 15000, true };
     //StartMoveAndMonitor(m, 10000.0, 3000.0, 3000.0);
     StartMoveWithApproach(ax, tgt, TaskId::LiftUp,
-        200000.0, 3000.0, 2000.0,
+        300000.0, 3000.0, 2000.0,
         100.0, 10.0, 30000,
         13000, { 10000.0, 500.0, 500.0 });
 }
