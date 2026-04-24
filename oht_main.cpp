@@ -384,6 +384,8 @@ static const int AX0_LIMIT_L_BIT = 0;
 static const int AX0_LIMIT_R_ADDR = 0;
 static const int AX0_LIMIT_R_BIT = 1;
 
+static constexpr int AX_LR_LIMIT_PROTECT_AXIS = 1;
+
 static const int AX2_LIMIT_ADDR = 8;
 static const int AX2_LIMIT_BIT = 1;
 static const int AX2_HOME_ADDR = 8;
@@ -599,14 +601,14 @@ static void Axis0ShowBlockedWarning(HWND hWnd, int dirSign)
 {
 	if (dirSign > 0) {
 		MessageBox(hWnd,
-			TEXT("Axis0: Left Limit 센서 ON 상태입니다.\r\n+ 방향 명령은 허용되지 않습니다."),
-			TEXT("Axis0 보호"),
+			TEXT("Axis1: Left Limit 센서 ON 상태입니다.\r\n+ 방향 명령은 허용되지 않습니다."),
+			TEXT("Axis1 보호"),
 			MB_ICONWARNING | MB_OK);
 	}
 	else if (dirSign < 0) {
 		MessageBox(hWnd,
-			TEXT("Axis0: Right Limit 센서 ON 상태입니다.\r\n- 방향 명령은 허용되지 않습니다."),
-			TEXT("Axis0 보호"),
+			TEXT("Axis1: Right Limit 센서 ON 상태입니다.\r\n- 방향 명령은 허용되지 않습니다."),
+			TEXT("Axis1 보호"),
 			MB_ICONWARNING | MB_OK);
 	}
 }
@@ -1411,7 +1413,7 @@ static bool StartRelMoveWithProfile(int axis, long long delta, double vpps, doub
 	}
 
 	// Axis0 보호: L/R 리밋에 따른 방향 차단
-	if (axis == 0 && g_commStarted) {
+	if (axis == AX_LR_LIMIT_PROTECT_AXIS && g_commStarted) {
 		long long sign = (delta >= 0) ? +1 : -1;
 		if (Axis0IsCommandBlocked(cur, tgt, sign)) {
 			if (g_hMainWnd) Axis0ShowBlockedWarning(g_hMainWnd, (int)sign);
@@ -1650,10 +1652,10 @@ static bool StartJog(HWND hWnd, int axis, int sign) {
 		}
 	}
 
-	if (axis == 0) {
+	if (axis == AX_LR_LIMIT_PROTECT_AXIS) {
 		// Axis0: L/R 리밋 방향 차단
 		g_cm.GetStatus(&g_status);
-		long long curPos = (long long)g_status.axesStatus[0].actualPos;
+		long long curPos = (long long)g_status.axesStatus[AX_LR_LIMIT_PROTECT_AXIS].actualPos;
 		if (Axis0IsCommandBlocked(curPos, curPos, (long long)sign)) {
 			Axis0ShowBlockedWarning(hWnd, sign);
 			return false;
@@ -1734,8 +1736,8 @@ static bool StartMultiJog(HWND hWnd, int sign) {
 		}
 
 		// Axis0 보호: L/R 리밋에 따른 방향 차단
-		if (a == 0) {
-			long long cur = (long long)g_status.axesStatus[0].actualPos;
+		if (a == AX_LR_LIMIT_PROTECT_AXIS) {
+			long long cur = (long long)g_status.axesStatus[a].actualPos;
 			long long tgt = cur + (long long)(sign * 1000000000LL);
 			if (Axis0IsCommandBlocked(cur, tgt, (long long)sign)) {
 				Axis0ShowBlockedWarning(hWnd, sign);
@@ -1836,9 +1838,9 @@ bool StartAbsMoveWithProfile(int axis, long long target, double vpps, double tAc
 	}
 
 	// Axis0 보호 체크: L/R 리밋에 따른 방향 금지
-	if (axis == 0 && g_commStarted) {
+	if (axis == AX_LR_LIMIT_PROTECT_AXIS && g_commStarted) {
 		g_cm.GetStatus(&g_status);
-		long long cur = (long long)g_status.axesStatus[0].actualPos;
+		long long cur = (long long)g_status.axesStatus[AX_LR_LIMIT_PROTECT_AXIS].actualPos;
 		long long delta = target - cur;
 		long long sign = (delta > 0) ? +1 : (delta < 0 ? -1 : 0);
 		if (sign != 0 && Axis0IsCommandBlocked(cur, target, sign)) {
@@ -3723,9 +3725,9 @@ static void DoAbsMoveAxis(HWND hWnd, int axis) {
 		}
 	}
 
-	if (axis == 0) {
+	if (axis == AX_LR_LIMIT_PROTECT_AXIS) {
 		g_cm.GetStatus(&g_status);
-		long long cur = (long long)g_status.axesStatus[0].actualPos;
+		long long cur = (long long)g_status.axesStatus[AX_LR_LIMIT_PROTECT_AXIS].actualPos;
 		double tgtD = GetDlgDouble(hWnd, ID_EDIT_POS_A(axis), 0.0);
 		long long tgt = (long long)std::llround(tgtD);
 		long long delta = tgt - cur;
@@ -3760,9 +3762,9 @@ static void DoRelMoveAxis(HWND hWnd, int axis, int dir) {
 	}
 
 	// Axis0 보호: 상대 이동 전 L/R 리밋 방향 차단
-	if (axis == 0) {
+	if (axis == AX_LR_LIMIT_PROTECT_AXIS) {
 		g_cm.GetStatus(&g_status);
-		long long cur = (long long)g_status.axesStatus[0].actualPos;
+		long long cur = (long long)g_status.axesStatus[AX_LR_LIMIT_PROTECT_AXIS].actualPos;
 		double step = GetDlgDouble(hWnd, ID_EDIT_POS_A(axis), 0.0) * dir;
 		long long tgt = cur + (long long)std::llround(step);
 		if (Axis0IsCommandBlocked(cur, tgt, (long long)dir)) {
@@ -3798,10 +3800,10 @@ static void DoMultiAbs(HWND hWnd) {
 		}
 
 		// Axis0 보호: L/R 리밋에 따른 방향 금지
-		if (a == 0) {
+		if (a == AX_LR_LIMIT_PROTECT_AXIS) {
 			g_cm.GetStatus(&g_status);
-			long long cur = (long long)g_status.axesStatus[0].actualPos;
-			long long tgt = (long long)std::llround(GetDlgDouble(hWnd, ID_EDIT_POS_A(0), 0.0));
+			long long cur = (long long)g_status.axesStatus[a].actualPos;
+			long long tgt = (long long)std::llround(GetDlgDouble(hWnd, ID_EDIT_POS_A(a), 0.0));
 			long long delta = tgt - cur;
 			long long sign = (delta > 0) ? +1 : (delta < 0 ? -1 : 0);
 			if (sign != 0 && Axis0IsCommandBlocked(cur, tgt, sign)) {
@@ -3836,10 +3838,10 @@ static void DoMultiRel(HWND hWnd) {
 		}
 
 		// Axis0 보호: 상대 이동 방향 차단
-		if (a == 0) {
+		if (a == AX_LR_LIMIT_PROTECT_AXIS) {
 			g_cm.GetStatus(&g_status);
-			long long cur = (long long)g_status.axesStatus[0].actualPos;
-			double step = GetDlgDouble(hWnd, ID_EDIT_POS_A(0), 0.0);
+			long long cur = (long long)g_status.axesStatus[a].actualPos;
+			double step = GetDlgDouble(hWnd, ID_EDIT_POS_A(a), 0.0);
 			long long tgt = cur + (long long)std::llround(step);
 			int dir = (step >= 0) ? +1 : -1;
 			if (Axis0IsCommandBlocked(cur, tgt, (long long)dir)) {
@@ -4494,9 +4496,9 @@ static void Sync_Control_Jog(HWND hWnd, int sign) {
 	}
 
 	// Axis0 보호: L/R 리밋에 따른 방향 조그 차단
-	if (ax == 0) {
+	if (ax == AX_LR_LIMIT_PROTECT_AXIS) {
 		g_cm.GetStatus(&g_status);
-		long long cur = (long long)g_status.axesStatus[0].actualPos;
+		long long cur = (long long)g_status.axesStatus[AX_LR_LIMIT_PROTECT_AXIS].actualPos;
 		long long tgt = cur + (long long)sign * 1000000000LL;
 		if (Axis0IsCommandBlocked(cur, tgt, (long long)sign)) {
 			Axis0ShowBlockedWarning(hWnd, sign);
@@ -4546,9 +4548,9 @@ static void Sync_Control_Abs(HWND hWnd) {
 	}
 
 	// Axis0 보호: 절대 이동 방향 차단 체크
-	if (ax == 0) {
+	if (ax == AX_LR_LIMIT_PROTECT_AXIS) {
 		g_cm.GetStatus(&g_status);
-		long long cur = (long long)g_status.axesStatus[0].actualPos;
+		long long cur = (long long)g_status.axesStatus[AX_LR_LIMIT_PROTECT_AXIS].actualPos;
 		long long tgtLL = (long long)std::llround(tgt);
 		long long delta = tgtLL - cur;
 		long long sign = (delta > 0) ? +1 : (delta < 0 ? -1 : 0);
@@ -4581,7 +4583,7 @@ static void Sync_Control_Rel(HWND hWnd, int sign) {
 	}
 
 	// Axis0 보호: 상대 이동 방향 차단 체크
-	if (ax == 0) {
+	if (ax == AX_LR_LIMIT_PROTECT_AXIS) {
 		if (Axis0IsCommandBlocked(cur, tgt, (long long)sign)) {
 			Axis0ShowBlockedWarning(hWnd, sign);
 			return;
@@ -6707,12 +6709,12 @@ static void CreateUI(HWND h) {
 	CreateWindow(TEXT("STATIC"), TEXT("A2 Home:"), WS_CHILD | WS_VISIBLE | SS_LEFT, 1400, 940, 70, 20, h, nullptr, nullptr, nullptr);
 	CreateWindow(TEXT("STATIC"), TEXT("-"), WS_CHILD | WS_VISIBLE | SS_LEFT | WS_BORDER, 1470, 937, 140, 24, h, (HMENU)(INT_PTR)ID_TXT_AX2_HOME, nullptr, nullptr);
 
-	// ================= Axis0 Limit L/R 상태 표시 (Axis2 옆) =================
-	CreateWindow(TEXT("STATIC"), TEXT("A0 L-Lim:"), WS_CHILD | WS_VISIBLE | SS_LEFT, 1170, 910, 70, 20, h, nullptr, nullptr, nullptr);
-	CreateWindow(TEXT("STATIC"), TEXT("-"),	WS_CHILD | WS_VISIBLE | SS_LEFT | WS_BORDER, 1240, 907, 140, 24, h, (HMENU)(INT_PTR)ID_TXT_AX0_LIMIT_L, nullptr, nullptr);
+	// ================= Axis1 Limit L/R 상태 표시 (Axis2 옆) =================
+	CreateWindow(TEXT("STATIC"), TEXT("A1 L-Lim:"), WS_CHILD | WS_VISIBLE | SS_LEFT, 1170, 910, 70, 20, h, nullptr, nullptr, nullptr);
+	CreateWindow(TEXT("STATIC"), TEXT("-"), WS_CHILD | WS_VISIBLE | SS_LEFT | WS_BORDER, 1240, 907, 140, 24, h, (HMENU)(INT_PTR)ID_TXT_AX0_LIMIT_L, nullptr, nullptr);
 
-	CreateWindow(TEXT("STATIC"), TEXT("A0 R-Lim:"), WS_CHILD | WS_VISIBLE | SS_LEFT, 1170, 940, 70, 20, h, nullptr, nullptr, nullptr);
-	CreateWindow(TEXT("STATIC"), TEXT("-"),	WS_CHILD | WS_VISIBLE | SS_LEFT | WS_BORDER, 1240, 937, 140, 24, h, (HMENU)(INT_PTR)ID_TXT_AX0_LIMIT_R, nullptr, nullptr);
+	CreateWindow(TEXT("STATIC"), TEXT("A1 R-Lim:"), WS_CHILD | WS_VISIBLE | SS_LEFT, 1170, 940, 70, 20, h, nullptr, nullptr, nullptr);
+	CreateWindow(TEXT("STATIC"), TEXT("-"), WS_CHILD | WS_VISIBLE | SS_LEFT | WS_BORDER, 1240, 937, 140, 24, h, (HMENU)(INT_PTR)ID_TXT_AX0_LIMIT_R, nullptr, nullptr);
 
 	int x = 10, y = 70, w = 1800, hgt = 120, gap = 6;
 	for (int a = 0; a < 4; ++a) CreateAxisGroup(h, a, x, y + a * (hgt + gap), w, hgt);
@@ -7487,7 +7489,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 					// L 리밋 처음 감지 시 급정지
 					if (!g_ax0LimitLLatched.exchange(true))
 					{
-						StopAxis(0);      // Axis0 급정지
+						StopAxis(AX_LR_LIMIT_PROTECT_AXIS);      // Axis 급정지
 					}
 					// L 리밋 ON 동안 + 방향 명령 차단
 					g_ax0BlockPlus = true;
@@ -7505,7 +7507,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 					// R 리밋 처음 감지 시 급정지
 					if (!g_ax0LimitRLatched.exchange(true))
 					{
-						StopAxis(0);      // Axis0 급정지
+						StopAxis(AX_LR_LIMIT_PROTECT_AXIS);      // Axis 급정지
 					}
 					// R 리밋 ON 동안 - 방향 명령 차단
 					g_ax0BlockMinus = true;

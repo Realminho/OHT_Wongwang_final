@@ -1799,7 +1799,7 @@ void Go_Workstation() {
     p.moveAxis = 1;        // ✅ 주행축
     //p.targetBarcodeAbs = 491332;
 	p.targetBarcodeAbs = 537813;
-    p.mainVel = 15000.0; p.mainAcc = 2000.0; p.mainDec = 3000.0;
+    p.mainVel = 30000.0; p.mainAcc = 2000.0; p.mainDec = 6000.0;
     p.corrVel = 1000.0; p.corrAcc = 1000.0; p.corrDec = 2000.0;
     p.deadband = 2;
     p.gear = 4.3; p.wheelDia = 70.0; p.motorCpr = 10000.0; p.bcMmPerCnt = 0.1;
@@ -1812,7 +1812,7 @@ void GO_Conveyor() {
     p.moveAxis = 1;        // ✅ 주행축
     //p.targetBarcodeAbs = 476774;
 	p.targetBarcodeAbs = 526608;
-    p.mainVel = 15000.0; p.mainAcc = 2000.0; p.mainDec = 3000.0;
+    p.mainVel = 30000.0; p.mainAcc = 2000.0; p.mainDec = 6000.0;
     p.corrVel = 1000.0; p.corrAcc = 1000.0; p.corrDec = 2000.0;
     p.deadband = 2;
     p.gear = 4.3; p.wheelDia = 70.0; p.motorCpr = 10000.0; p.bcMmPerCnt = 0.1;
