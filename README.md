@@ -470,29 +470,6 @@ Fastech/Welcon 에러 JSON을 프로그램에 연결하고 검색 UI를 구현�
 
 ---
 
-## Demo Media Checklist
-
-포트폴리오 제출 전 아래 자료를 추가하면 좋습니다.
-
-- [x] OHT 전체 주행 영상
-- [ ] Load 자동 시퀀스 영상
-- [ ] Unload 자동 시퀀스 영상
-- [ ] PLC 명령 → OHT 동작 → DONE 영상
-- [ ] Stop / Reset 동작 영상
-- [ ] Win32 제어 UI 캡처
-- [ ] Error Manual 검색 화면
-- [ ] EtherCAT / Servo / PLC 구성 사진
-
----
-
-## Suggested Resume Bullet
-
-README만 보는 채용 담당자가 아니라 이력서에도 프로젝트를 연결하고 싶다면 다음 정도로 요약할 수 있습니다.
-
-> **C++/WMX3 기반 OHT 제어 SW 개발**: EtherCAT servo motion, TCP/IP PLC protocol, Load/Unload 자동 시퀀스, sensor interlock 및 Stop/Reset/Alarm state machine을 구현하여 실장비 자동 운전 로직 통합.
-
----
-
 ### Keywords
 
 `Robotics` `OHT` `Motion Control` `C++` `WMX3` `EtherCAT` `PLC` `TCP/IP` `Servo` `Win32` `GPIO` `Automation` `Material Handling` `Sequence Control`
